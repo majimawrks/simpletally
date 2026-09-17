@@ -1,0 +1,32 @@
+[package]
+name = "simpletally"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The binary. Ships as SimpleTally.exe (PLAN.md, decision #1).
+[[bin]]
+name = "SimpleTally"
+path = "src/main.rs"
+
+[dependencies]
+simpletally-core = { path = "../core" }
+# UI + windowing
+egui.workspace = true
+egui-winit.workspace = true
+egui_glow.workspace = true
+winit.workspace = true
+glutin.workspace = true
+glutin-winit.workspace = true
+# Tray + hotkey
+tray-icon.workspace = true
+global-hotkey.workspace = true
+ico.workspace = true
+windows-sys.workspace = true
+# Settings + dialogs + fuzzy match + theme
+serde.workspace = true
+toml.workspace = true
+rfd.workspace = true
+nucleo.workspace = true
+dark-light.workspace = true
+chrono.workspace = true

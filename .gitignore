@@ -1,0 +1,40 @@
+# Archive / reference / handoff folders — everything prefixed with an underscore.
+# _design/  _misc/  _simpletally3/  _rustrefactor/  and any future _notes/ etc.
+_*/
+
+# Agent instructions. Must stay at the repo root (Claude Code reads it from there),
+# so it is ignored by name rather than by folder.
+CLAUDE.md
+AGENTS.md
+
+# Development notes live in notes/ and ARE tracked during development — the plan changes
+# often enough that its history is worth having. At final build the folder is renamed to
+# _notes/, which the _*/ rule above then ignores. See notes/PLAN.md §2.
+#   git rm -r --cached notes
+#   git mv notes _notes      (or: mv notes _notes)
+#   git commit -m "untrack development notes"
+# Note: this stops tracking them going forward; it does not erase them from history.
+
+# Machine-local build config: it names a drive that only exists on one machine (and the
+# machine itself), and it rides along via OneDrive rather than git. See CLAUDE.md.
+.cargo/config.toml
+
+# Rust build output. The real target dir is E:/simpletally-target (see .cargo/config.toml),
+# but ignore the default too in case a stray command writes here.
+/target/
+**/*.rs.bk
+*.pdb
+
+# Databases and their WAL companions — user data, never committed.
+*.db
+*.db-wal
+*.db-shm
+*.tally
+*.premigration_*
+*.restore_backup_*
+
+# Local editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

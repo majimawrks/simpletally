@@ -1,0 +1,22 @@
+# Normalize line endings so the repo is deterministic regardless of any machine's
+# core.autocrlf setting. Text files are stored with LF in the repository; Git may
+# still check them out as CRLF on Windows, but what gets committed is always LF.
+* text=auto eol=lf
+
+# Rust / config / docs — explicitly text.
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.lock  text eol=lf
+*.sql   text eol=lf
+*.csv   text eol=lf
+
+# Binary assets — never touched by line-ending or diff machinery.
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ttf   binary
+*.otf   binary
+*.db    binary
+*.tally binary

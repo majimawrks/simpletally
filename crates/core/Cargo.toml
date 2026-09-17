@@ -1,0 +1,15 @@
+[package]
+name = "simpletally-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Data layer: schema, v3.8 migration, queries, aggregates, CSV codecs (PLAN §4).
+# Exposes a domain API that owns its own transactions — never hands out a bare
+# &Connection (PLAN §2, boundary rule 1).
+
+[dependencies]
+rusqlite.workspace = true
+chrono.workspace = true
+csv.workspace = true
+serde.workspace = true
