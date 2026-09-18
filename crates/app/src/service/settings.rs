@@ -80,6 +80,11 @@ pub struct Settings {
     /// having crashed.
     #[serde(default)]
     pub hide_to_tray_notice_dismissed: bool,
+    /// When true, `[x]` quits instead of hiding to the tray. Default false — hide-to-tray is
+    /// the behaviour the global hotkey depends on, so it stays the default (BACKLOG:
+    /// "close-button behaviour"). Set from the switch on the close notice.
+    #[serde(default)]
+    pub close_quits: bool,
 }
 
 fn default_version() -> u32 {
@@ -110,6 +115,7 @@ impl Default for Settings {
             note_field_open: false,
             main_window_geometry: None,
             hide_to_tray_notice_dismissed: false,
+            close_quits: false,
         }
     }
 }
@@ -232,6 +238,7 @@ mod tests {
                 height: 720,
             }),
             hide_to_tray_notice_dismissed: true,
+            close_quits: true,
         };
 
         save(&settings, &tmp.path).expect("save should succeed");

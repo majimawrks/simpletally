@@ -102,6 +102,12 @@ pub struct App {
     /// Mirrors `Settings::hide_to_tray_notice_dismissed`; the live value `current_settings`
     /// writes back. Loaded at startup, set when the user ticks the checkbox.
     hide_to_tray_notice_dismissed: bool,
+    /// Mirrors `Settings::close_quits`: `[x]` ends the process instead of hiding to tray.
+    close_quits: bool,
+    /// Set from inside a paint, acted on in `about_to_wait`. `redraw_main` has no
+    /// `&ActiveEventLoop` to call `exit()` on, and tearing the loop down mid-paint would be a
+    /// poor idea even if it did.
+    quit_requested: bool,
 }
 
 /// Minimum time between settings writes. Dragging or resizing the main window would
@@ -260,6 +266,8 @@ impl App {
             pending_import: None,
             tray_notice: crate::ui::tray_notice::TrayNoticeState::default(),
             hide_to_tray_notice_dismissed: loaded_settings.hide_to_tray_notice_dismissed,
+            close_quits: loaded_settings.close_quits,
+            quit_requested: false,
             last_saved_settings: loaded_settings,
             last_save_at: Instant::now(),
             settings_save_error_logged: false,
@@ -368,13 +376,22 @@ impl App {
         // sitting there, indistinguishable from a hang.
         // The notice is the last thing standing between `[x]` and the window going away, so
         // the hide happens here, once it's dismissed.
-        if let crate::ui::tray_notice::Action::Closed { remember } = notice_action {
+        if let crate::ui::tray_notice::Action::Closed { remember, close_quits } = notice_action {
             // Held on `App`, not written into `last_saved_settings`: that field is what the
             // change detector compares *against*, so setting it there would make the new value
             // look already-saved and it would never reach the file. `current_settings` picks
             // it up, `hide_main`'s flush writes it.
             self.hide_to_tray_notice_dismissed |= remember;
-            self.hide_main();
+            self.close_quits = close_quits;
+            // Honour the switch on this very press: they pressed `[x]`, then said what `[x]`
+            // means. Flushing first because `exiting()` runs after the loop tears down and the
+            // preference that caused the quit must survive it.
+            if close_quits {
+                self.flush_settings();
+                self.quit_requested = true;
+            } else {
+                self.hide_main();
+            }
         }
 
         if let Some(chosen) = self.pending_import.take() {
@@ -624,6 +641,7 @@ impl App {
         s.note_field_open = self.today.note_open;
         s.main_window_geometry = self.current_geometry();
         s.hide_to_tray_notice_dismissed = self.hide_to_tray_notice_dismissed;
+        s.close_quits = self.close_quits;
         s
     }
 
@@ -781,10 +799,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // explain that this hides rather than quits, and hide only once the notice
                     // is dismissed. The notice is drawn in this window's own egui pass, so
                     // hiding first would show it to nobody.
-                    if self.hide_to_tray_notice_dismissed {
+                    if self.close_quits {
+                        // Same deferral as the notice's own quit: `about_to_wait` owns the
+                        // exit, so the flush happens before the loop tears down.
+                        self.flush_settings();
+                        self.quit_requested = true;
+                    } else if self.hide_to_tray_notice_dismissed {
                         self.hide_main();
                     } else {
-                        self.tray_notice.maybe_open(false);
+                        self.tray_notice.open(self.close_quits);
                         if let Some(w) = self.main.as_ref() {
                             w.window().request_redraw();
                         }
@@ -886,6 +909,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The close notice asked to quit (its switch was on). Acted on here rather than inside
+        // the paint that produced it — see `quit_requested`.
+        if self.quit_requested {
+            event_loop.exit();
+            return;
+        }
         let now = Instant::now();
         let mut earliest: Option<Instant> = None;
         for slot in [&mut self.main, &mut self.popup] {
