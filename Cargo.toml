@@ -44,6 +44,10 @@ rfd          = "0.17"
 nucleo       = "0.5"
 dark-light   = "3.0"
 
+# Build-time only: stamps the icon + version metadata into the exe's Win32 resource table
+# (Phase 5). Never linked into the shipped binary.
+winresource  = "0.1"
+
 # Slimmer, faster release binary — size tuning is finalised in Phase 5 but these are
 # cheap to set now and keep the spike's release build honest.
 [profile.release]

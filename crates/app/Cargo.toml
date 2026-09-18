@@ -9,6 +9,11 @@ rust-version.workspace = true
 name = "SimpleTally"
 path = "src/main.rs"
 
+# Runs `build.rs`, which embeds the app icon and version metadata as Win32 resources.
+# A *build* dependency: it never becomes part of the shipped binary.
+[build-dependencies]
+winresource.workspace = true
+
 [dependencies]
 simpletally-core = { path = "../core" }
 # UI + windowing
