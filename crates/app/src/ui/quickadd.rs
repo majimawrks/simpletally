@@ -43,6 +43,9 @@ struct Row {
     name: String,
     category_name: String,
     today_count: i64,
+    /// How many of today's tallies a `-N` could actually take from this type. Lower than
+    /// `today_count` when a row carries a note, which core will not delete.
+    removable: i64,
 }
 
 /// Query results, rebuilt from the DB only when `dirty` — mirrors `today.rs`/`types.rs`'s
@@ -51,6 +54,10 @@ struct View {
     types: Vec<TaskType>,
     today_counts: BTreeMap<i64, i64>,
     categories: BTreeMap<i64, String>,
+    /// Per type, how many of today's tallies `-N` can take — `entries::removable` applied to
+    /// the day's rows. Kept beside the totals so the preview can never promise a removal the
+    /// write will refuse.
+    today_removable: BTreeMap<i64, i64>,
 }
 
 pub struct QuickAddState {
@@ -91,9 +98,13 @@ fn date_sql(d: NaiveDate) -> String {
     format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day())
 }
 
-/// Splits `raw` into (search text, count). A trailing integer in `1..=9999` is the count
-/// only when there's non-empty text before it — otherwise the whole trimmed string is
-/// search text and the count defaults to 1.
+/// Splits `raw` into (search text, count). A trailing integer whose magnitude is `1..=9999`
+/// is the count, but only when there's non-empty text before it — otherwise the whole trimmed
+/// string is search text and the count defaults to 1.
+///
+/// A **negative** count removes: `konsultasi -3` takes three of today's tallies back off that
+/// type. Nothing negative is ever stored — core deletes/decrements real rows, so
+/// `CHECK (count > 0)` still holds unconditionally (PLAN §1.1).
 pub fn parse_query(raw: &str) -> (String, i64) {
     let trimmed = raw.trim();
     if let Some(idx) = trimmed.rfind(char::is_whitespace) {
@@ -101,7 +112,7 @@ pub fn parse_query(raw: &str) -> (String, i64) {
         let tail = trimmed[idx..].trim_start();
         if !head.is_empty() {
             if let Ok(n) = tail.parse::<i64>() {
-                if (1..=9999).contains(&n) {
+                if (1..=9999).contains(&n.abs()) {
                     return (head.to_string(), n);
                 }
             }
@@ -165,7 +176,9 @@ fn load(db: &Db) -> Result<View, simpletally_core::Error> {
         .collect();
     Ok(View {
         types: db.list_task_types(true)?,
-        today_counts: BTreeMap::new(), // filled by caller once `today` is known — see `show`.
+        // Both maps are filled by the caller once `today` is known — see `show`.
+        today_counts: BTreeMap::new(),
+        today_removable: BTreeMap::new(),
         categories,
     })
 }
@@ -204,13 +217,26 @@ pub fn show(
                 // A failure here must be surfaced, not defaulted away: an empty map makes
                 // every preview read `+3 → 3` instead of `+3 → 7`, which looks like real
                 // data rather than a missing query.
-                match db.day_type_totals(&today_sql) {
-                    Ok(rows) => {
+                match (db.day_type_totals(&today_sql), db.day_log_rows(&today_sql)) {
+                    (Ok(totals), Ok(log)) => {
                         view.today_counts =
-                            rows.into_iter().map(|r| (r.task_type_id, r.count)).collect();
+                            totals.into_iter().map(|r| (r.task_type_id, r.count)).collect();
+                        // Group the day's individual rows per type and ask core the same
+                        // question the write will ask: how much of this is actually takeable.
+                        let mut per_type: BTreeMap<i64, Vec<(i64, bool)>> = BTreeMap::new();
+                        for r in log {
+                            per_type
+                                .entry(r.task_type_id)
+                                .or_default()
+                                .push((r.count, !r.notes.trim().is_empty()));
+                        }
+                        view.today_removable = per_type
+                            .into_iter()
+                            .map(|(id, rows)| (id, simpletally_core::entries::removable(rows)))
+                            .collect();
                         state.error = None;
                     }
-                    Err(e) => state.error = Some(e.to_string()),
+                    (Err(e), _) | (_, Err(e)) => state.error = Some(e.to_string()),
                 }
                 state.view = Some(view);
             }
@@ -237,6 +263,7 @@ pub fn show(
                 name: ty.name.clone(),
                 category_name: view.categories.get(&ty.category_id).cloned().unwrap_or_default(),
                 today_count: view.today_counts.get(&ty.id).copied().unwrap_or(0),
+                removable: view.today_removable.get(&ty.id).copied().unwrap_or(0),
             })
         })
         .collect();
@@ -264,15 +291,11 @@ pub fn show(
     }
     if confirm {
         if let Some(row) = rows.get(state.selected) {
-            match db.add_tally(row.task_type_id, &today_sql, count, "") {
-                Ok(_) => {
-                    action = Action::Logged(format!("+{count} {}", row.name));
-                }
-                Err(e) => {
-                    // A write failure must not dismiss the popup — surface it in place of
-                    // the footer hint and let the user retry.
-                    state.error = Some(e.to_string());
-                }
+            match commit(db, row, &today_sql, count) {
+                Ok(line) => action = Action::Logged(line),
+                // A write failure must not dismiss the popup — surface it in place of the
+                // footer hint and let the user retry.
+                Err(e) => state.error = Some(e),
             }
         }
     }
@@ -347,8 +370,8 @@ pub fn show(
             let resp = ui.interact(row_rect, ui.id().with(("quickadd_row", row.task_type_id)), egui::Sense::click());
             if resp.clicked() {
                 state.selected = i;
-                match db.add_tally(row.task_type_id, &today_sql, count, "") {
-                    Ok(_) => action = Action::Logged(format!("+{count} {}", row.name)),
+                match commit(db, row, &today_sql, count) {
+                    Ok(line) => action = Action::Logged(line),
                     Err(e) => state.error = Some(e.to_string()),
                 }
             }
@@ -365,6 +388,31 @@ pub fn show(
     // missing. Click-*away* dismissal belongs to the platform shell, which sees focus loss.
 
     action
+}
+
+/// The single write path, shared by Enter and by a row click so the two can never drift.
+/// A positive `count` adds; a negative one removes that many of today's tallies for the type.
+/// Returns the confirmation line, which states what actually happened — a removal is
+/// routinely smaller than what was asked for.
+fn commit(db: &Db, row: &Row, today_sql: &str, count: i64) -> Result<String, String> {
+    if count >= 0 {
+        return db
+            .add_tally(row.task_type_id, today_sql, count, "")
+            .map(|_| format!("+{count} {}", row.name))
+            .map_err(|e| e.to_string());
+    }
+    let asked = -count;
+    let report =
+        db.remove_tallies(row.task_type_id, today_sql, asked).map_err(|e| e.to_string())?;
+    let mut line = format!("\u{2212}{} {}", report.removed, row.name);
+    if report.removed < asked {
+        line.push_str(&if report.notes_protected > 0 {
+            format!(" \u{2014} asked for {asked}, the rest carries a note")
+        } else {
+            format!(" \u{2014} asked for {asked}, that was all of today's")
+        });
+    }
+    Ok(line)
 }
 
 fn paint_input_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, _query: &str) {
@@ -424,21 +472,38 @@ fn paint_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, row: &Row,
         pt.row_category,
     );
 
-    let resulting = row.today_count + count;
     painter.text(
         egui::pos2(rect.right() - 12.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
-        format!("+{count} \u{2192} {resulting}"),
+        preview_text(row.today_count, row.removable, count),
         t::mono(13.0),
-        pt.accent,
+        if count < 0 { pt.removal } else { pt.accent },
     );
+}
+
+/// The `+3 → 7` / `−3 → 4` outcome preview.
+///
+/// For a removal this shows what will **actually** happen, not what was typed: capped at
+/// what today holds, and at what core will part with (a note-carrying row keeps its last
+/// tally). Quick add dismisses on Enter, so this line is the only chance the user gets to
+/// see a destructive action before it happens — a preview that over-promised and then
+/// silently clamped would be worse than no preview at all.
+pub fn preview_text(today_count: i64, removable: i64, count: i64) -> String {
+    if count >= 0 {
+        return format!("+{count} \u{2192} {}", today_count + count);
+    }
+    let take = (-count).min(removable).max(0);
+    format!("\u{2212}{take} \u{2192} {}", today_count - take)
 }
 
 fn paint_footer(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, error: Option<&str>) {
     let painter = ui.painter();
     painter.rect(rect, egui::CornerRadius::same(0), pt.footer_bg, egui::Stroke::new(1.0, pt.divider), egui::StrokeKind::Inside);
 
-    let text = error.unwrap_or("\u{2191}\u{2193} choose    trailing digits = count    Esc dismiss");
+    // Deviates from UI_SPEC's footer text, which predates `-N`. A destructive gesture nobody
+    // can discover is worse than a hint that no longer matches the doc.
+    let text =
+        error.unwrap_or("\u{2191}\u{2193} choose    trailing digits = count, -N removes    Esc dismiss");
     let color = if error.is_some() { pt.accent } else { pt.muted_text };
     painter.text(
         egui::pos2(rect.left() + 22.0, rect.center().y),
@@ -518,12 +583,39 @@ mod tests {
         assert_eq!(parse_query("berkas\u{a0}4"), ("berkas".to_string(), 4));
     }
 
-    /// A negative number parses fine as an `i64`, so only the range check keeps it out of
-    /// `add_tally`, where core's `CHECK (count > 0)` would reject it.
+    /// A leading `-` makes the count a removal. The magnitude is range-checked exactly like a
+    /// positive one, so an absurd `-99999` stays search text rather than becoming a removal.
     #[test]
-    fn parse_query_negative_count_stays_in_text() {
-        assert_eq!(parse_query("reset pass -3"), ("reset pass -3".to_string(), 1));
+    fn parse_query_negative_count_is_a_removal() {
+        assert_eq!(parse_query("konsultasi -3"), ("konsultasi".to_string(), -3));
+        assert_eq!(parse_query("konsultasi -1"), ("konsultasi".to_string(), -1));
         assert_eq!(parse_query("reset pass 007"), ("reset pass".to_string(), 7));
+        assert_eq!(parse_query("konsultasi -0"), ("konsultasi -0".to_string(), 1));
+        assert_eq!(parse_query("konsultasi -99999"), ("konsultasi -99999".to_string(), 1));
+        // Still needs text in front, so a bare "-2" searches rather than removing from
+        // whatever happens to be selected.
+        assert_eq!(parse_query("-2"), ("-2".to_string(), 1));
+    }
+
+    /// The preview is the only thing standing between a typo and destroyed data, so it shows
+    /// what will actually happen — never what was asked for.
+    #[test]
+    fn preview_never_promises_a_removal_that_cannot_happen() {
+        // Adding: straightforward.
+        assert_eq!(preview_text(4, 4, 3), "+3 \u{2192} 7");
+        assert_eq!(preview_text(0, 0, 1), "+1 \u{2192} 1");
+
+        // Removing within what today holds.
+        assert_eq!(preview_text(7, 7, -3), "\u{2212}3 \u{2192} 4");
+
+        // Asking for more than exists shows the truth, not the ask.
+        assert_eq!(preview_text(2, 2, -5), "\u{2212}2 \u{2192} 0");
+        assert_eq!(preview_text(0, 0, -3), "\u{2212}0 \u{2192} 0");
+
+        // A note-carrying row keeps its last tally, so `removable` is below `today_count`
+        // and the preview stops there rather than promising a zero it cannot reach.
+        assert_eq!(preview_text(3, 2, -3), "\u{2212}2 \u{2192} 1");
+        assert_eq!(preview_text(1, 0, -1), "\u{2212}0 \u{2192} 1");
     }
 
     // --- rank ---

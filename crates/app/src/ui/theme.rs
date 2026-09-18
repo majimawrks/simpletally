@@ -499,6 +499,9 @@ pub struct PopupTheme {
     pub row_selected_border: egui::Color32,
     pub row_name: egui::Color32,
     pub row_category: egui::Color32,
+    /// The `−3 → 4` preview when the query asks to remove. The app's `negative`, which
+    /// README §"Colour" already assigns to a `−1` delta.
+    pub removal: egui::Color32,
 }
 
 /// The quick-add popup's fixed palette.
@@ -517,6 +520,7 @@ pub fn popup() -> PopupTheme {
         row_selected_border: C::from_rgb(0x35, 0x57, 0x3F),
         row_name: C::from_rgb(0xF2, 0xF1, 0xEC),
         row_category: C::from_rgb(0x6D, 0x6A, 0x62),
+        removal: C::from_rgb(0xB4, 0x48, 0x3F),
     }
 }
 

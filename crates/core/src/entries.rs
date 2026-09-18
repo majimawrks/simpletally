@@ -21,6 +21,29 @@ pub enum RemoveOutcome {
     NoOp,
 }
 
+/// What [`remove_tallies`] actually did — the quick-add popup reports this back, because it
+/// is routinely less than what was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RemoveReport {
+    /// Tallies actually removed.
+    pub removed: i64,
+    /// Rows deleted outright (their whole count was taken).
+    pub rows_deleted: usize,
+    /// Rows left holding a tally **only** because they carry a note — see [`remove_tallies`].
+    pub notes_protected: usize,
+}
+
+/// How many tallies [`remove_tallies`] could take from a day's rows, given `(count, has_note)`
+/// for each. A note-carrying row can be reduced but never emptied, so it contributes
+/// `count - 1`.
+///
+/// Pure, and public, so the quick-add preview shows the number the write will really produce
+/// instead of the number the user asked for. A preview that silently over-promises is the
+/// same defect as a silent clamp.
+pub fn removable(rows: impl IntoIterator<Item = (i64, bool)>) -> i64 {
+    rows.into_iter().map(|(count, has_note)| if has_note { count - 1 } else { count }).sum()
+}
+
 /// Validates that `date` is a real calendar day, returning [`Error::Invalid`] otherwise.
 fn require_valid_date(date: &str) -> Result<()> {
     if dates::parse_sql(date).is_none() {
@@ -101,6 +124,76 @@ pub(crate) fn remove_most_recent(conn: &Connection, task_type_id: i64, date: &st
     Ok(outcome)
 }
 
+/// Remove up to `n` tallies for `(task_type_id, date)`, walking the day's entries newest
+/// first (PLAN §1.1's ordering: `created_at DESC, id DESC`, the `id` breaking ties because
+/// `created_at` has limited resolution). The quick-add popup's `-3`.
+///
+/// This spans **every** entry for the day, not just the newest one like
+/// [`remove_most_recent`]: whether five tallies sit in one row of five or five rows of one is
+/// an implementation detail the user never sees, so `-5` must not depend on it.
+///
+/// **A row carrying a note is never deleted.** It is decremented to a floor of 1 and then
+/// skipped. A count is re-entered in seconds; the free text in `notes` is not, and quick add
+/// dismisses itself immediately, so the user would never see what went. `notes_protected`
+/// reports how many rows this spared so the caller can say so.
+///
+/// Removing more than the day holds removes what it holds. One transaction; `n < 1` is
+/// [`Error::Invalid`].
+pub(crate) fn remove_tallies(
+    conn: &Connection,
+    task_type_id: i64,
+    date: &str,
+    n: i64,
+) -> Result<RemoveReport> {
+    if n < 1 {
+        return Err(Error::Invalid(format!("remove count must be at least 1, got {n}")));
+    }
+    require_valid_date(date)?;
+
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(
+        "SELECT id, count, notes FROM entries
+         WHERE task_type_id = ?1 AND date = ?2
+         ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows: Vec<(i64, i64, String)> = stmt
+        .query_map(rusqlite::params![task_type_id, date], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    let mut report = RemoveReport::default();
+    let mut remaining = n;
+    for (id, count, notes) in rows {
+        if remaining == 0 {
+            break;
+        }
+        let has_note = !notes.trim().is_empty();
+        // A noted row keeps its last tally, so at most `count - 1` is available from it.
+        let available = if has_note { count - 1 } else { count };
+        let take = available.min(remaining);
+
+        if take > 0 {
+            if take == count {
+                tx.execute("DELETE FROM entries WHERE id = ?1", [id])?;
+                report.rows_deleted += 1;
+            } else {
+                tx.execute("UPDATE entries SET count = count - ?1 WHERE id = ?2", [take, id])?;
+            }
+            report.removed += take;
+            remaining -= take;
+        }
+        // Wanted more from this row and a note is what stopped us.
+        if has_note && remaining > 0 {
+            report.notes_protected += 1;
+        }
+    }
+
+    tx.commit()?;
+    Ok(report)
+}
+
 /// Updates every field of an existing entry (the day-log edit dialog). Validates
 /// `date`/`count` as in [`add_tally`]; `entry_id` and `task_type_id` must both exist
 /// or this returns [`Error::NotFound`].
@@ -165,6 +258,134 @@ mod tests {
         )
         .optional()
         .unwrap()
+    }
+
+    // -- remove_tallies (quick add's `-N`) --
+
+    /// Adds an entry with an explicit `created_at` so the newest-first walk is deterministic
+    /// rather than at the mercy of same-millisecond inserts.
+    fn seed(conn: &Connection, date: &str, count: i64, notes: &str, ts: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO entries (task_type_id, date, count, notes, created_at) \
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![date, count, notes, ts],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn day_total(conn: &Connection, date: &str) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM entries WHERE date = ?1",
+            [date],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remove_tallies_spans_every_row_of_the_day() {
+        let conn = setup();
+        // 2 + 1 + 2 = 5 tallies across three rows; `-4` must not stop at the newest row.
+        let a = seed(&conn, "2026-01-05", 2, "", "2026-01-05 09:00:00.000");
+        let b = seed(&conn, "2026-01-05", 1, "", "2026-01-05 10:00:00.000");
+        let c = seed(&conn, "2026-01-05", 2, "", "2026-01-05 11:00:00.000");
+
+        let report = remove_tallies(&conn, 1, "2026-01-05", 4).unwrap();
+        assert_eq!(report.removed, 4);
+        assert_eq!(report.rows_deleted, 2, "newest two rows fully consumed");
+        assert_eq!(day_total(&conn, "2026-01-05"), 1);
+        // Newest first: c and b go, a is decremented to 1.
+        assert!(get_entry(&conn, c).is_none());
+        assert!(get_entry(&conn, b).is_none());
+        assert_eq!(get_entry(&conn, a).unwrap().2, 1);
+    }
+
+    #[test]
+    fn remove_tallies_never_empties_a_noted_row() {
+        let conn = setup();
+        let noted = seed(&conn, "2026-01-05", 3, "asked twice, same ticket", "2026-01-05 09:00:00.000");
+
+        // Asking for all 3 takes 2 and leaves the row — and its note — standing.
+        let report = remove_tallies(&conn, 1, "2026-01-05", 3).unwrap();
+        assert_eq!(report.removed, 2);
+        assert_eq!(report.rows_deleted, 0);
+        assert_eq!(report.notes_protected, 1);
+        let (_, _, count, notes) = get_entry(&conn, noted).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(notes, "asked twice, same ticket");
+    }
+
+    #[test]
+    fn remove_tallies_takes_from_plain_rows_before_a_note_blocks() {
+        let conn = setup();
+        let noted = seed(&conn, "2026-01-05", 2, "context", "2026-01-05 09:00:00.000");
+        let plain = seed(&conn, "2026-01-05", 2, "", "2026-01-05 10:00:00.000");
+
+        // 4 present, 3 removable (the noted row keeps one).
+        let report = remove_tallies(&conn, 1, "2026-01-05", 9).unwrap();
+        assert_eq!(report.removed, 3);
+        assert_eq!(report.rows_deleted, 1);
+        assert_eq!(report.notes_protected, 1);
+        assert!(get_entry(&conn, plain).is_none());
+        assert_eq!(get_entry(&conn, noted).unwrap().2, 1);
+        assert_eq!(day_total(&conn, "2026-01-05"), 1);
+    }
+
+    #[test]
+    fn remove_tallies_clamps_and_is_a_no_op_on_an_empty_day() {
+        let conn = setup();
+        seed(&conn, "2026-01-05", 2, "", "2026-01-05 09:00:00.000");
+
+        let report = remove_tallies(&conn, 1, "2026-01-05", 10).unwrap();
+        assert_eq!(report.removed, 2);
+        assert_eq!(day_total(&conn, "2026-01-05"), 0);
+
+        let again = remove_tallies(&conn, 1, "2026-01-05", 3).unwrap();
+        assert_eq!(again, RemoveReport::default(), "nothing left to take");
+    }
+
+    #[test]
+    fn remove_tallies_leaves_other_days_and_types_alone() {
+        let conn = setup();
+        conn.execute("INSERT INTO task_types (category_id, name) VALUES (1, 'Lain')", []).unwrap();
+        let other_day = seed(&conn, "2026-01-04", 5, "", "2026-01-04 09:00:00.000");
+        conn.execute(
+            "INSERT INTO entries (task_type_id, date, count, notes, created_at) \
+             VALUES (2, '2026-01-05', 4, '', '2026-01-05 09:00:00.000')",
+            [],
+        )
+        .unwrap();
+        seed(&conn, "2026-01-05", 1, "", "2026-01-05 10:00:00.000");
+
+        remove_tallies(&conn, 1, "2026-01-05", 99).unwrap();
+        assert_eq!(get_entry(&conn, other_day).unwrap().2, 5);
+        assert_eq!(day_total(&conn, "2026-01-05"), 4, "the other type's row is untouched");
+    }
+
+    #[test]
+    fn remove_tallies_rejects_a_non_positive_count_and_a_bad_date() {
+        let conn = setup();
+        assert!(matches!(remove_tallies(&conn, 1, "2026-01-05", 0), Err(Error::Invalid(_))));
+        assert!(matches!(remove_tallies(&conn, 1, "2026-01-05", -2), Err(Error::Invalid(_))));
+        assert!(matches!(remove_tallies(&conn, 1, "2026-02-30", 1), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn removable_matches_what_remove_tallies_will_take() {
+        // The preview's number and the write's number come from the same rule.
+        assert_eq!(removable([(2, false), (1, false), (2, false)]), 5);
+        assert_eq!(removable([(3, true)]), 2);
+        assert_eq!(removable([(2, true), (2, false)]), 3);
+        assert_eq!(removable([(1, true)]), 0, "a noted row of 1 gives nothing");
+        assert_eq!(removable([]), 0);
+
+        let conn = setup();
+        seed(&conn, "2026-01-05", 2, "note", "2026-01-05 09:00:00.000");
+        seed(&conn, "2026-01-05", 2, "", "2026-01-05 10:00:00.000");
+        let predicted = removable([(2, true), (2, false)]);
+        let report = remove_tallies(&conn, 1, "2026-01-05", 100).unwrap();
+        assert_eq!(report.removed, predicted);
     }
 
     // -- add_tally --

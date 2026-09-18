@@ -9,7 +9,7 @@ use crate::aggregate::{
 };
 use crate::catalog;
 use crate::dates::DateRange;
-use crate::entries::RemoveOutcome;
+use crate::entries::{RemoveOutcome, RemoveReport};
 use crate::error::{Error, Result};
 use crate::model::{Category, TaskType};
 use crate::trash::{DeletionSummary, RestoreReport};
@@ -141,6 +141,12 @@ impl Db {
 
     pub fn remove_most_recent(&self, task_type_id: i64, date: &str) -> Result<RemoveOutcome> {
         entries::remove_most_recent(&self.conn, task_type_id, date)
+    }
+
+    /// Remove up to `n` tallies across the whole day (quick add's `-3`). Never empties a
+    /// note-carrying row — see [`crate::entries::remove_tallies`].
+    pub fn remove_tallies(&self, task_type_id: i64, date: &str, n: i64) -> Result<RemoveReport> {
+        entries::remove_tallies(&self.conn, task_type_id, date, n)
     }
 
     pub fn edit_entry(
