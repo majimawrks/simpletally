@@ -52,6 +52,10 @@ pub struct TypesState {
     /// moves entries. `app.rs` drains this after each frame and marks Today and Insights
     /// dirty so they re-query.
     data_changed: bool,
+    /// The "Back up your data" dialog (PLAN §1.4). Its own module owns the interaction state,
+    /// same shape as `migrate`/`tray_notice`; this screen just owns the field since the
+    /// toolbar button that opens it lives here.
+    backup: crate::ui::backup::BackupState,
 }
 
 enum Modal {
@@ -200,6 +204,7 @@ impl TypesState {
             view: None,
             error: None,
             data_changed: false,
+            backup: crate::ui::backup::BackupState::new(),
         }
     }
 
@@ -477,6 +482,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme) {
     import_report_modal(ui, state, theme);
     manage_categories_modal(ui, state, db, theme);
     trash_modal(ui, state, db, theme, &snap);
+    crate::ui::backup::show(ui, &mut state.backup, db, theme);
 }
 
 /// Toolbar: search, category filter, active filter, "Manage categories" link, then
@@ -547,9 +553,13 @@ fn toolbar(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
         // the two buttons land on top of "Manage categories".
         // Icons, not labels: three text buttons plus the filters overflowed the row at the
         // window's real width and `New type` was clipped off the right edge.
-        let right_w = CTRL_H * 3.0 + 20.0;
+        let right_w = CTRL_H * 4.0 + 30.0;
         let free = ui.max_rect().right() - ui.cursor().left() - right_w;
         ui.add_space(free.max(10.0));
+        if icon_button(ui, theme, Icon::Archive, false, "Back up your data", false).clicked() {
+            state.backup.open(db);
+        }
+        ui.add_space(10.0);
         let trashed = snap.trash.len();
         let tip = if trashed == 0 {
             "Trash \u{2014} empty".to_string()
@@ -599,6 +609,7 @@ fn link_width(ui: &egui::Ui, label: &str) -> f32 {
 /// is a guess that only fails on someone else's machine.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Icon {
+    Archive,
     Trash,
     Import,
     Plus,
@@ -646,6 +657,15 @@ fn paint_icon(p: &egui::Painter, icon: Icon, c: egui::Pos2, color: egui::Color32
         p.line_segment([egui::pos2(c.x + a.0, c.y + a.1), egui::pos2(c.x + b.0, c.y + b.1)], s);
     };
     match icon {
+        Icon::Archive => {
+            // Lucide's `archive` (24x24), converted to this 18px box: local = (lucide - 12) * 0.75.
+            // Rects, not lines, so it can't be mistaken for Import's arrow-into-a-tray.
+            let lid = egui::Rect::from_min_max(egui::pos2(c.x - 7.5, c.y - 6.75), egui::pos2(c.x + 7.5, c.y - 3.0));
+            p.rect(lid, egui::CornerRadius::same(1), egui::Color32::TRANSPARENT, s, egui::StrokeKind::Inside);
+            let body = egui::Rect::from_min_max(egui::pos2(c.x - 6.0, c.y - 3.0), egui::pos2(c.x + 6.0, c.y + 6.75));
+            p.rect(body, egui::CornerRadius::ZERO, egui::Color32::TRANSPARENT, s, egui::StrokeKind::Inside);
+            line((-1.5, 0.0), (1.5, 0.0)); // handle
+        }
         Icon::Trash => {
             line((-3.0, -7.0), (3.0, -7.0)); // handle
             line((-7.5, -4.5), (7.5, -4.5)); // lid
@@ -1798,9 +1818,9 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
             ImportOutcome::Report(r) => {
                 // Cards, not a list of "label: n" lines: the one number that answers "did it
                 // work" is `imported`, and a flat list buried it among four zeros.
-                stat_card_row(ui, theme, W, &[(r.imported as i64, "IMPORTED", true)]);
+                crate::ui::widgets::card::stat_row(ui, theme, W, &[(r.imported as i64, "IMPORTED", true)]);
                 ui.add_space(8.0);
-                stat_card_row(
+                crate::ui::widgets::card::stat_row(
                     ui,
                     theme,
                     W,
@@ -1810,7 +1830,7 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
                     ],
                 );
                 ui.add_space(8.0);
-                stat_card_row(
+                crate::ui::widgets::card::stat_row(
                     ui,
                     theme,
                     W,
@@ -2230,7 +2250,7 @@ fn accent_outline_button(
 /// Painted rather than laid out with `ui.horizontal`, which centres the two galleys against
 /// each other \u2014 JetBrains Mono's taller ascent then lifts the subtitle above the title it
 /// belongs to, which reads as a misalignment.
-fn modal_header(ui: &mut egui::Ui, theme: &Theme, title: &str, subtitle: &str) -> bool {
+pub(crate) fn modal_header(ui: &mut egui::Ui, theme: &Theme, title: &str, subtitle: &str) -> bool {
     const H: f32 = 30.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), H), egui::Sense::hover());
     let baseline = rect.bottom() - 2.0;
@@ -2297,72 +2317,6 @@ fn trash_empty_state(ui: &mut egui::Ui, theme: &Theme) {
         );
     });
     ui.add_space(24.0);
-}
-
-/// A row of equal-width stat cards: a number over a mono eyebrow label. `hero` gives the card
-/// the accent number and a bigger type size — used for the one figure that answers the
-/// question the dialog exists to answer.
-///
-/// A zero is drawn in `text_disabled` rather than hidden: "0 malformed" is reassurance, and a
-/// card that disappears would move the ones beside it between imports.
-fn stat_card_row(ui: &mut egui::Ui, theme: &Theme, width: f32, cards: &[(i64, &str, bool)]) {
-    const GAP: f32 = 8.0;
-    const PAD: f32 = 12.0;
-    /// Between the number's baseline block and the label under it.
-    const LEAD: f32 = 6.0;
-
-    let hero = cards.iter().any(|(_, _, h)| *h);
-    let value_font = t::mono_medium(if hero { 22.0 } else { 17.0 });
-    let label_font = t::mono(t::EYEBROW);
-
-    // Measure, never assume. The first version hard-coded the card height and positioned the
-    // label from the bottom edge, so at 48px the number and its label overlapped outright.
-    let probe = |font: egui::FontId| {
-        ui.painter().layout_no_wrap("0".to_owned(), font, egui::Color32::PLACEHOLDER).rect.height()
-    };
-    let value_h = probe(value_font.clone());
-    let label_h = probe(label_font.clone());
-    let height = PAD * 2.0 + value_h + LEAD + label_h;
-
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let n = cards.len().max(1) as f32;
-    let card_w = (width - GAP * (n - 1.0)) / n;
-
-    for (i, (value, label, is_hero)) in cards.iter().enumerate() {
-        let card = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + i as f32 * (card_w + GAP), rect.top()),
-            egui::vec2(card_w, height),
-        );
-        let p = ui.painter();
-        p.rect(
-            card,
-            egui::CornerRadius::same(8),
-            theme.bg_sunken,
-            egui::Stroke::new(1.0, theme.border_subtle),
-            egui::StrokeKind::Inside,
-        );
-        let value_color = if *value == 0 {
-            theme.text_disabled
-        } else if *is_hero {
-            theme.accent
-        } else {
-            theme.text_primary
-        };
-        p.text(
-            egui::pos2(card.left() + PAD, card.top() + PAD),
-            egui::Align2::LEFT_TOP,
-            value.to_string(),
-            value_font.clone(),
-            value_color,
-        );
-        p.text(
-            egui::pos2(card.left() + PAD, card.top() + PAD + value_h + LEAD),
-            egui::Align2::LEFT_TOP,
-            *label,
-            label_font.clone(),
-            theme.text_tertiary,
-        );
-    }
 }
 
 // --- category management (screen 08) ------------------------------------------------------
