@@ -621,7 +621,7 @@ fn edit_dialog(
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if link(ui, "×", theme.text_tertiary, t::sans(t::SECTION_TITLE + 5.0)).clicked() {
+                    if crate::ui::widgets::close::close_button(ui, theme).clicked() {
                         want_cancel = true;
                     }
                 });

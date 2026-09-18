@@ -143,10 +143,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut MigrateState, theme: &Theme, exe_dir:
                     .color(theme.text_primary),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Label::new(egui::RichText::new("\u{d7}").font(t::sans(t::SECTION_TITLE)).color(theme.text_secondary)).sense(egui::Sense::click()))
-                    .clicked()
-                {
+                if crate::ui::widgets::close::close_button(ui, theme).clicked() {
                     close = true;
                 }
             });

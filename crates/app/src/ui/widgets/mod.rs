@@ -1,5 +1,6 @@
 //! Custom egui widgets: tally tile, category pill, day-log row, day-nav pill, 正 glyph,
-//! Insights daily-activity chart.
+//! Insights daily-activity chart, dialog close button.
+pub mod close;
 pub mod tile;
 pub mod pill;
 pub mod logrow;

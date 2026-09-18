@@ -1044,7 +1044,7 @@ fn edit_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme,
                     ui.label(egui::RichText::new(s).font(t::mono(t::EYEBROW)).color(theme.text_quiet));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if link(ui, theme, "\u{d7}").clicked() {
+                    if crate::ui::widgets::close::close_button(ui, theme).clicked() {
                         want_cancel = true;
                     }
                 });
@@ -1588,9 +1588,9 @@ fn category_picker(
                     .font(t::sans_medium(t::SECTION_TITLE))
                     .color(theme.text_primary),
             );
-            let x_w = text_width(ui, "\u{d7}", t::sans(t::SECTION_TITLE));
-            ui.add_space((ui.max_rect().right() - ui.cursor().left() - x_w - 4.0).max(4.0));
-            if link(ui, theme, "\u{d7}").clicked() {
+            let x_w = crate::ui::widgets::close::SIZE;
+            ui.add_space((ui.max_rect().right() - ui.cursor().left() - x_w).max(4.0));
+            if crate::ui::widgets::close::close_button(ui, theme).clicked() {
                 close = true;
             }
         });
@@ -2244,18 +2244,13 @@ fn modal_header(ui: &mut egui::Ui, theme: &Theme, title: &str, subtitle: &str) -
         );
     }
 
-    let x_w = text_width(ui, "\u{d7}", t::sans(t::SECTION_TITLE));
+    let x = crate::ui::widgets::close::SIZE;
     let x_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - x_w - 4.0, rect.center().y - 11.0),
-        egui::vec2(x_w + 4.0, 22.0),
+        egui::pos2(rect.right() - x, rect.center().y - x / 2.0),
+        egui::vec2(x, x),
     );
-    let mut x_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt(("modal_header_close", title))
-            .max_rect(x_rect)
-            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
-    );
-    link(&mut x_ui, theme, "\u{d7}").clicked()
+    crate::ui::widgets::close::close_button_at(ui, theme, x_rect, ("modal_header_close", title))
+        .clicked()
 }
 
 /// The empty state: a big muted zero, then what the trash is for.
