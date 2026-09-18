@@ -1941,24 +1941,14 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
     egui::Modal::new(egui::Id::new("type_trash")).show(ui.ctx(), |ui| {
         ui.set_width(560.0);
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Trash").font(t::sans_medium(t::SECTION_TITLE)).color(theme.text_primary),
-            );
-            ui.add_space(8.0);
-            let caption = if snap.trash.is_empty() {
-                "empty".to_string()
-            } else {
-                trash_header(types_held, tallies_held)
-            };
-            ui.label(egui::RichText::new(caption).font(t::mono(t::CAPTION)).color(theme.text_tertiary));
-
-            let free = ui.max_rect().right() - ui.cursor().left() - 20.0;
-            ui.add_space(free.max(8.0));
-            if link_colored(ui, theme.text_secondary, "\u{2715}").clicked() {
-                close = true;
-            }
-        });
+        let caption = if snap.trash.is_empty() {
+            "empty".to_string()
+        } else {
+            trash_header(types_held, tallies_held)
+        };
+        if modal_header(ui, theme, "Trash", &caption) {
+            close = true;
+        }
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(8.0);
@@ -2005,6 +1995,9 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
         ui.separator();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
+            // Same trick as the toolbar: without this the frameless link is only its text tall
+            // and centres above the 32px `Close` button beside it.
+            ui.spacing_mut().interact_size.y = CTRL_H;
             if !snap.trash.is_empty() && link_colored(ui, theme.negative, "Purge all now").clicked() {
                 ask_purge_all = true;
             }
@@ -2236,6 +2229,49 @@ fn accent_outline_button(
     resp
 }
 
+/// A modal header: title, a mono subtitle on the **same baseline**, and the house `\u{d7}`
+/// close on the right. Returns whether close was clicked.
+///
+/// Painted rather than laid out with `ui.horizontal`, which centres the two galleys against
+/// each other \u2014 JetBrains Mono's taller ascent then lifts the subtitle above the title it
+/// belongs to, which reads as a misalignment.
+fn modal_header(ui: &mut egui::Ui, theme: &Theme, title: &str, subtitle: &str) -> bool {
+    const H: f32 = 30.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), H), egui::Sense::hover());
+    let baseline = rect.bottom() - 2.0;
+
+    let t_galley =
+        ui.painter().layout_no_wrap(title.to_owned(), t::sans_medium(t::SECTION_TITLE), theme.text_primary);
+    let t_w = t_galley.rect.width();
+    ui.painter().galley(
+        egui::pos2(rect.left(), baseline - t_galley.rect.height()),
+        t_galley,
+        theme.text_primary,
+    );
+    if !subtitle.is_empty() {
+        let s_galley =
+            ui.painter().layout_no_wrap(subtitle.to_owned(), t::mono(t::CAPTION), theme.text_tertiary);
+        ui.painter().galley(
+            egui::pos2(rect.left() + t_w + 10.0, baseline - s_galley.rect.height()),
+            s_galley,
+            theme.text_tertiary,
+        );
+    }
+
+    let x_w = text_width(ui, "\u{d7}", t::sans(t::SECTION_TITLE));
+    let x_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - x_w - 4.0, rect.center().y - 11.0),
+        egui::vec2(x_w + 4.0, 22.0),
+    );
+    let mut x_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("modal_header_close", title))
+            .max_rect(x_rect)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+    );
+    link(&mut x_ui, theme, "\u{d7}").clicked()
+}
+
 /// The empty state: a big muted zero, then what the trash is for.
 fn trash_empty_state(ui: &mut egui::Ui, theme: &Theme) {
     ui.add_space(24.0);
@@ -2335,26 +2371,11 @@ fn manage_categories_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, t
             // content, so swapping a row into rename mode otherwise nudges it narrower.
             ui.allocate_exact_size(egui::vec2(MODAL_W, 0.0), egui::Sense::hover());
 
-            // Header: title + counts, then × (single right_to_left after fixed-width
-            // labels is fine — the LAYOUT TRAP is nested right_to_left colliding with
-            // *several* left-hand controls, not this).
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Manage categories").font(t::sans_medium(t::SECTION_TITLE)).color(theme.text_primary),
-                );
-                ui.add_space(8.0);
-                let n_types: i64 = modal.rows.iter().map(|r| r.type_count).sum();
-                ui.label(
-                    egui::RichText::new(format!("{} categories \u{b7} {} types", modal.rows.len(), n_types))
-                        .font(t::mono(t::EYEBROW))
-                        .color(theme.text_quiet),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if link(ui, theme, "\u{d7}").clicked() {
-                        close = true;
-                    }
-                });
-            });
+            let n_types: i64 = modal.rows.iter().map(|r| r.type_count).sum();
+            let subtitle = format!("{} categories \u{b7} {} types", modal.rows.len(), n_types);
+            if modal_header(ui, theme, "Manage categories", &subtitle) {
+                close = true;
+            }
             ui.separator();
             ui.add_space(6.0);
 
