@@ -1786,36 +1786,47 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
     }
     let mut close = false;
     egui::Modal::new(egui::Id::new("type_import_report")).show(ui.ctx(), |ui| {
-        ui.set_width(360.0);
+        const W: f32 = 420.0;
+        ui.set_width(W);
+        // Pin the width: the body switches between the card grid and a one-line error, and the
+        // modal frame would otherwise resize under the user.
+        ui.allocate_exact_size(egui::vec2(W, 0.0), egui::Sense::hover());
         ui.label(egui::RichText::new("Import CSV").font(t::sans_medium(t::SECTION_TITLE)).color(theme.text_primary));
         ui.separator();
+        ui.add_space(10.0);
         match outcome {
             ImportOutcome::Report(r) => {
-                ui.label(egui::RichText::new(format!("Imported: {}", r.imported)).font(t::sans(t::BODY)).color(theme.text_body));
-                ui.label(
-                    egui::RichText::new(format!("Already existed: {}", r.skipped_existing))
-                        .font(t::sans(t::BODY))
-                        .color(theme.text_body),
+                // Cards, not a list of "label: n" lines: the one number that answers "did it
+                // work" is `imported`, and a flat list buried it among four zeros.
+                stat_card_row(ui, theme, W, &[(r.imported as i64, "IMPORTED", true)], 56.0);
+                ui.add_space(8.0);
+                stat_card_row(
+                    ui,
+                    theme,
+                    W,
+                    &[
+                        (r.categories_created as i64, "CATEGORIES CREATED", false),
+                        (r.skipped_existing as i64, "ALREADY EXISTED", false),
+                    ],
+                    48.0,
                 );
-                ui.label(
-                    egui::RichText::new(format!("Duplicate in file: {}", r.skipped_in_file))
-                        .font(t::sans(t::BODY))
-                        .color(theme.text_body),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Malformed rows skipped: {}", r.skipped_malformed))
-                        .font(t::sans(t::BODY))
-                        .color(theme.text_body),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Categories created: {}", r.categories_created))
-                        .font(t::sans(t::BODY))
-                        .color(theme.text_body),
+                ui.add_space(8.0);
+                stat_card_row(
+                    ui,
+                    theme,
+                    W,
+                    &[
+                        (r.skipped_in_file as i64, "DUPLICATE IN FILE", false),
+                        (r.skipped_malformed as i64, "MALFORMED, SKIPPED", false),
+                    ],
+                    48.0,
                 );
                 if r.encoding == "windows-1252" {
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("used windows-1252 encoding").font(t::sans(t::CAPTION)).color(theme.text_quiet),
+                        egui::RichText::new("read as windows-1252, not UTF-8")
+                            .font(t::mono(t::CAPTION))
+                            .color(theme.text_quiet),
                     );
                 }
             }
@@ -1823,7 +1834,7 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
                 ui.colored_label(theme.negative, e);
             }
         }
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(
@@ -2288,6 +2299,61 @@ fn trash_empty_state(ui: &mut egui::Ui, theme: &Theme) {
         );
     });
     ui.add_space(24.0);
+}
+
+/// A row of equal-width stat cards: a number over a mono eyebrow label. `hero` gives the card
+/// the accent number and a bigger type size — used for the one figure that answers the
+/// question the dialog exists to answer.
+///
+/// A zero is drawn in `text_disabled` rather than hidden: "0 malformed" is reassurance, and a
+/// card that disappears would move the ones beside it between imports.
+fn stat_card_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    width: f32,
+    cards: &[(i64, &str, bool)],
+    height: f32,
+) {
+    const GAP: f32 = 8.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let n = cards.len().max(1) as f32;
+    let card_w = (width - GAP * (n - 1.0)) / n;
+
+    for (i, (value, label, hero)) in cards.iter().enumerate() {
+        let card = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + i as f32 * (card_w + GAP), rect.top()),
+            egui::vec2(card_w, height),
+        );
+        let p = ui.painter();
+        p.rect(
+            card,
+            egui::CornerRadius::same(8),
+            theme.bg_sunken,
+            egui::Stroke::new(1.0, theme.border_subtle),
+            egui::StrokeKind::Inside,
+        );
+        let value_color = if *value == 0 {
+            theme.text_disabled
+        } else if *hero {
+            theme.accent
+        } else {
+            theme.text_primary
+        };
+        p.text(
+            egui::pos2(card.left() + 14.0, card.top() + 10.0),
+            egui::Align2::LEFT_TOP,
+            value.to_string(),
+            t::mono_medium(if *hero { 22.0 } else { 17.0 }),
+            value_color,
+        );
+        p.text(
+            egui::pos2(card.left() + 14.0, card.bottom() - 10.0),
+            egui::Align2::LEFT_BOTTOM,
+            *label,
+            t::mono(t::EYEBROW),
+            theme.text_tertiary,
+        );
+    }
 }
 
 // --- category management (screen 08) ------------------------------------------------------

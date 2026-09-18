@@ -274,7 +274,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut MigrateState, theme: &Theme, exe_dir:
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if plain_button(ui, theme, "Start empty") {
+                        if secondary_button(ui, theme, "Start empty") {
                             close = true;
                         }
                     });
@@ -303,10 +303,24 @@ fn close_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
     .clicked()
 }
 
-/// An unfilled text button for the least-committal action ("Start empty").
-fn plain_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
-    ui.add(egui::Button::new(egui::RichText::new(label).font(t::sans(t::BODY)).color(theme.text_secondary)).fill(egui::Color32::TRANSPARENT))
-        .clicked()
+/// The secondary button beside the accent-filled primary ("Start empty" next to "Choose a
+/// file…"). Same silhouette as [`close_button`] — 32px tall, 6px radius — so the two read as a
+/// pair of real buttons, but neutral-filled with a border instead of accent.
+///
+/// It used to be transparent text in `text_secondary`, which is how this codebase paints
+/// *disabled* text, so the app's only "no thanks" affordance looked unavailable. Deliberately
+/// not given a colour of its own: the palette is two hues (accent green, `negative` terracotta)
+/// and a third would be the only one in the app — and a coloured opt-out would compete with the
+/// recommended action instead of deferring to it.
+fn secondary_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).font(t::sans_medium(t::BODY)).color(theme.text_body))
+            .fill(theme.bg_raised)
+            .stroke(egui::Stroke::new(1.0, theme.border_strong))
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 32.0)),
+    )
+    .clicked()
 }
 
 #[cfg(test)]
