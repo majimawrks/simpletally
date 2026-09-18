@@ -1727,7 +1727,12 @@ fn active_switch(ui: &mut egui::Ui, theme: &Theme, on: bool) -> egui::Response {
     );
     let anim = ui.ctx().animate_bool_with_time(ui.id().with("type_active_switch"), on, 0.12);
     let track_bg = if on { theme.accent } else { theme.bg_track };
-    ui.painter().rect(track_rect, egui::CornerRadius::same((track_h / 2.0) as u8), track_bg, egui::Stroke::NONE, egui::StrokeKind::Inside);
+    // Border while off: `bg_track` sits almost on top of `bg_sunken` in dark mode, and an
+    // unoutlined off track reads as empty space rather than a switch. Same fix as the close
+    // notice's switch.
+    let track_stroke =
+        if on { egui::Stroke::NONE } else { egui::Stroke::new(1.0, theme.border_strong) };
+    ui.painter().rect(track_rect, egui::CornerRadius::same((track_h / 2.0) as u8), track_bg, track_stroke, egui::StrokeKind::Inside);
 
     let knob_r = track_h / 2.0 - 2.0;
     let knob_x = track_rect.left() + knob_r + 2.0 + anim * (track_w - knob_r * 2.0 - 4.0);
