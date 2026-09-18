@@ -3,6 +3,9 @@
 use winit::dpi::PhysicalPosition;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, POINT};
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -38,6 +41,28 @@ pub fn exclude_from_alt_tab(window: &winit::window::Window) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Ask the compositor to round `window`'s corners (UI_SPEC: the quick-add popup is a 10px
+/// rounded panel). A borderless winit window is square, and nothing egui paints can change
+/// the window's own shape — the corners it doesn't cover would show the desktop.
+///
+/// Windows 11 only. On Windows 10 `DwmSetWindowAttribute` fails for this attribute and the
+/// popup stays square, which is why the painted panel uses the same background as the GL
+/// clear colour: square corners look intentional, not broken.
+pub fn round_corners(window: &winit::window::Window) {
+    let Some(hwnd) = hwnd(window) else { return };
+    let pref = DWMWCP_ROUND;
+    // SAFETY: FFI; `pref` outlives the call and its size is what the attribute expects.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            // The constant is typed `DWMWINDOWATTRIBUTE` (i32) but the FFI takes a u32.
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            std::ptr::from_ref(&pref).cast(),
+            std::mem::size_of_val(&pref) as u32,
         );
     }
 }

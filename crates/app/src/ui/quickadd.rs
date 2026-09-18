@@ -201,12 +201,18 @@ pub fn show(
         state.dirty = false;
         match load(db) {
             Ok(mut view) => {
-                view.today_counts = db
-                    .day_type_totals(&today_sql)
-                    .map(|rows| rows.into_iter().map(|r| (r.task_type_id, r.count)).collect())
-                    .unwrap_or_default();
+                // A failure here must be surfaced, not defaulted away: an empty map makes
+                // every preview read `+3 → 3` instead of `+3 → 7`, which looks like real
+                // data rather than a missing query.
+                match db.day_type_totals(&today_sql) {
+                    Ok(rows) => {
+                        view.today_counts =
+                            rows.into_iter().map(|r| (r.task_type_id, r.count)).collect();
+                        state.error = None;
+                    }
+                    Err(e) => state.error = Some(e.to_string()),
+                }
                 state.view = Some(view);
-                state.error = None;
             }
             Err(e) => {
                 state.view = None;
@@ -273,9 +279,11 @@ pub fn show(
 
     let full = ui.max_rect();
     let bg_rect = egui::Rect::from_min_size(full.min, egui::vec2(WIDTH, height_for(state)));
+    // The window itself is rounded by the compositor (`winos::round_corners`), so this radius
+    // only has to agree with it — painting square corners here would show as dark wedges.
     ui.painter().rect(
         bg_rect,
-        egui::CornerRadius::same(0),
+        egui::CornerRadius::same(10),
         pt.bg,
         egui::Stroke::new(1.0, pt.border),
         egui::StrokeKind::Inside,
@@ -384,7 +392,8 @@ fn paint_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, row: &Row,
 
     let name_color = if selected { pt.query_text } else { pt.row_name };
     let name_galley =
-        ui.painter().layout_no_wrap(row.name.clone(), t::sans(t::TILE_NAME), name_color);
+        // 14.5 per UI_SPEC; SECTION_TITLE is that size, TILE_NAME (14.0) is the grid's.
+        ui.painter().layout_no_wrap(row.name.clone(), t::sans(t::SECTION_TITLE), name_color);
     let name_w = name_galley.rect.width();
     painter.galley(
         egui::pos2(rect.left() + 14.0, rect.center().y - name_galley.rect.height() / 2.0),
@@ -480,6 +489,26 @@ mod tests {
     #[test]
     fn parse_query_empty_string() {
         assert_eq!(parse_query(""), ("".to_string(), 1));
+    }
+
+    /// The split slices on a byte index from `rfind`, so a multi-byte char anywhere in the
+    /// query is the case that would panic if that index ever stopped landing on a boundary.
+    /// Type names here are Indonesian and the user can type anything.
+    #[test]
+    fn parse_query_handles_multi_byte_characters() {
+        assert_eq!(parse_query("perékaman berkas 3"), ("perékaman berkas".to_string(), 3));
+        assert_eq!(parse_query("笔记 2"), ("笔记".to_string(), 2));
+        assert_eq!(parse_query("café"), ("café".to_string(), 1));
+        // Non-breaking space is whitespace to `char::is_whitespace`, and multi-byte.
+        assert_eq!(parse_query("berkas\u{a0}4"), ("berkas".to_string(), 4));
+    }
+
+    /// A negative number parses fine as an `i64`, so only the range check keeps it out of
+    /// `add_tally`, where core's `CHECK (count > 0)` would reject it.
+    #[test]
+    fn parse_query_negative_count_stays_in_text() {
+        assert_eq!(parse_query("reset pass -3"), ("reset pass -3".to_string(), 1));
+        assert_eq!(parse_query("reset pass 007"), ("reset pass".to_string(), 7));
     }
 
     // --- rank ---

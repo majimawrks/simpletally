@@ -426,6 +426,7 @@ impl ApplicationHandler<UserEvent> for App {
         // skip_taskbar hides it from the taskbar but not Alt-Tab; make it a tool
         // window so it never shows there (PHASE0 acceptance).
         super::winos::exclude_from_alt_tab(popup.window());
+        super::winos::round_corners(popup.window());
         self.popup = Some(popup);
 
         self.tray = Some(Tray::new(&self.proxy));
