@@ -31,6 +31,8 @@ pub struct TodayState {
     pub log_collapsed: bool,
     pub pending_note: String,
     pub last_action: Option<String>,
+    /// Set by [`TodayState::mark_written`]; drained by `app.rs` to mark Insights dirty.
+    data_changed: bool,
     /// The open edit-entry dialog, if any (clicking a log row opens it).
     editing: Option<EditForm>,
     dirty: bool,
@@ -79,6 +81,7 @@ impl TodayState {
             log_collapsed: false,
             pending_note: String::new(),
             last_action: None,
+            data_changed: false,
             editing: None,
             dirty: true,
             view: None,
@@ -90,6 +93,21 @@ impl TodayState {
     /// Task types screen) writes something that changes the category pill row here.
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// A write landed: this screen must rebuild, and so must Insights, whose cached view is
+    /// now stale. Set at every mutation site — a filter or date change calls `mark_dirty`
+    /// alone, because nothing outside this screen changed.
+    fn mark_written(&mut self) {
+        self.dirty = true;
+        self.data_changed = true;
+    }
+
+    /// Consumed by `app.rs` once per frame: did a write here invalidate the other screens?
+    /// Without this, tallying on Today left an already-loaded Insights showing stale totals
+    /// while its CSV export queried fresh data — the two disagreed.
+    pub fn take_data_changed(&mut self) -> bool {
+        std::mem::take(&mut self.data_changed)
     }
 
     /// Reset for a **different database** (the migration import swaps the whole file out).
@@ -874,7 +892,7 @@ fn edit_dialog(
     match result {
         Ok(()) => {
             state.editing = None;
-            state.mark_dirty();
+            state.mark_written();
         }
         Err(e) => {
             if let Some(f) = state.editing.as_mut() {
@@ -1092,7 +1110,7 @@ fn apply(state: &mut TodayState, db: &Db, action: Action) {
                     // pending_note clears only after the write commits (PLAN §5).
                     state.pending_note.clear();
                     state.last_action = Some(format!("logged {name}"));
-                    state.mark_dirty();
+                    state.mark_written();
                 }
                 Err(e) => state.error = Some(e.to_string()),
             }
@@ -1101,7 +1119,7 @@ fn apply(state: &mut TodayState, db: &Db, action: Action) {
             Ok(RemoveOutcome::NoOp) => {}
             Ok(_) => {
                 state.last_action = Some(format!("removed {name}"));
-                state.mark_dirty();
+                state.mark_written();
             }
             Err(e) => state.error = Some(e.to_string()),
         },

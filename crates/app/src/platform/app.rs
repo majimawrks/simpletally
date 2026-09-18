@@ -342,6 +342,12 @@ impl App {
                 today.mark_dirty();
                 insights.mark_dirty();
             }
+            // The same the other way: a tally, edit or delete on Today changes the totals an
+            // already-loaded Insights is showing. Without this its view stayed stale while its
+            // CSV export queried fresh data, so the screen and the export disagreed.
+            if today.take_data_changed() {
+                insights.mark_dirty();
+            }
             // NB: painting must NOT change visibility — a stray repaint would otherwise
             // re-show a window closed to the tray. Visibility is owned by show_/hide_.
         }

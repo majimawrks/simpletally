@@ -58,6 +58,10 @@ struct View {
     /// the day's rows. Kept beside the totals so the preview can never promise a removal the
     /// write will refuse.
     today_removable: BTreeMap<i64, i64>,
+    /// The date these counts describe. The popup is a resident window whose state is only
+    /// reloaded when `dirty`, but its write date is read fresh every frame — so one left open
+    /// across midnight would preview yesterday's totals and commit against today.
+    loaded_for: chrono::NaiveDate,
 }
 
 pub struct QuickAddState {
@@ -176,9 +180,10 @@ fn load(db: &Db) -> Result<View, simpletally_core::Error> {
         .collect();
     Ok(View {
         types: db.list_task_types(true)?,
-        // Both maps are filled by the caller once `today` is known — see `show`.
+        // Both maps and `loaded_for` are filled by the caller once `today` is known — `show`.
         today_counts: BTreeMap::new(),
         today_removable: BTreeMap::new(),
+        loaded_for: chrono::NaiveDate::default(),
         categories,
     })
 }
@@ -210,34 +215,28 @@ pub fn show(
     let pt = t::popup();
     let today_sql = date_sql(today);
 
-    if state.dirty {
+    // A resident popup left open across midnight would otherwise keep yesterday's counts while
+    // writing to today: the view reloads on `dirty`, but the write date is read fresh here.
+    let stale_day = state.view.as_ref().is_some_and(|v| v.loaded_for != today);
+    if state.dirty || stale_day {
         state.dirty = false;
         match load(db) {
             Ok(mut view) => {
                 // A failure here must be surfaced, not defaulted away: an empty map makes
                 // every preview read `+3 → 3` instead of `+3 → 7`, which looks like real
                 // data rather than a missing query.
-                match (db.day_type_totals(&today_sql), db.day_log_rows(&today_sql)) {
-                    (Ok(totals), Ok(log)) => {
+                // `removable_by_type`, never `day_log_rows`: that one is the Today log band's
+                // query and stops at five rows, so it would under-report what a removal takes.
+                match (db.day_type_totals(&today_sql), db.removable_by_type(&today_sql)) {
+                    (Ok(totals), Ok(removable)) => {
                         view.today_counts =
                             totals.into_iter().map(|r| (r.task_type_id, r.count)).collect();
-                        // Group the day's individual rows per type and ask core the same
-                        // question the write will ask: how much of this is actually takeable.
-                        let mut per_type: BTreeMap<i64, Vec<(i64, bool)>> = BTreeMap::new();
-                        for r in log {
-                            per_type
-                                .entry(r.task_type_id)
-                                .or_default()
-                                .push((r.count, !r.notes.trim().is_empty()));
-                        }
-                        view.today_removable = per_type
-                            .into_iter()
-                            .map(|(id, rows)| (id, simpletally_core::entries::removable(rows)))
-                            .collect();
+                        view.today_removable = removable;
                         state.error = None;
                     }
                     (Err(e), _) | (_, Err(e)) => state.error = Some(e.to_string()),
                 }
+                view.loaded_for = today;
                 state.view = Some(view);
             }
             Err(e) => {

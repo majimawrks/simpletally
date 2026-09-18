@@ -44,6 +44,30 @@ pub fn removable(rows: impl IntoIterator<Item = (i64, bool)>) -> i64 {
     rows.into_iter().map(|(count, has_note)| if has_note { count - 1 } else { count }).sum()
 }
 
+/// [`removable`] per task type for one day, over **every** row of that day.
+///
+/// The quick-add preview must not be built from `aggregate::day_log_rows`: that query is the
+/// Today screen's log band and carries `LIMIT 5`, so it sees only the five newest rows across
+/// all types. `remove_tallies` walks the lot, so a preview built from it silently
+/// *under*-promises and the write takes more than the user was shown.
+pub(crate) fn removable_by_type(
+    conn: &Connection,
+    date: &str,
+) -> Result<std::collections::BTreeMap<i64, i64>> {
+    require_valid_date(date)?;
+    let mut stmt =
+        conn.prepare("SELECT task_type_id, count, notes FROM entries WHERE date = ?1")?;
+    let rows: Vec<(i64, i64, String)> = stmt
+        .query_map([date], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut per_type: std::collections::BTreeMap<i64, Vec<(i64, bool)>> = Default::default();
+    for (type_id, count, notes) in rows {
+        per_type.entry(type_id).or_default().push((count, !notes.trim().is_empty()));
+    }
+    Ok(per_type.into_iter().map(|(id, rows)| (id, removable(rows))).collect())
+}
+
 /// Validates that `date` is a real calendar day, returning [`Error::Invalid`] otherwise.
 fn require_valid_date(date: &str) -> Result<()> {
     if dates::parse_sql(date).is_none() {
@@ -369,6 +393,37 @@ mod tests {
         assert!(matches!(remove_tallies(&conn, 1, "2026-01-05", 0), Err(Error::Invalid(_))));
         assert!(matches!(remove_tallies(&conn, 1, "2026-01-05", -2), Err(Error::Invalid(_))));
         assert!(matches!(remove_tallies(&conn, 1, "2026-02-30", 1), Err(Error::Invalid(_))));
+    }
+
+    /// The bug this exists to prevent: the preview was built from `day_log_rows`, which is the
+    /// Today log band's query and carries `LIMIT 5`. With more than five rows in a day the
+    /// preview under-promised and the write took more than the user was shown.
+    #[test]
+    fn removable_by_type_sees_past_the_log_bands_five_row_cap() {
+        let conn = setup();
+        conn.execute("INSERT INTO task_types (category_id, name) VALUES (1, 'Lain')", []).unwrap();
+        // Seven rows for type 1 — more than `day_log_rows` would ever return.
+        for i in 0..7 {
+            seed(&conn, "2026-01-05", 1, "", &format!("2026-01-05 09:0{i}:00.000"));
+        }
+        // A note-carrying row, and another type, and another day, to prove the grouping.
+        seed(&conn, "2026-01-05", 3, "kept", "2026-01-05 10:00:00.000");
+        conn.execute(
+            "INSERT INTO entries (task_type_id, date, count, notes, created_at) \
+             VALUES (2, '2026-01-05', 4, '', '2026-01-05 11:00:00.000')",
+            [],
+        )
+        .unwrap();
+        seed(&conn, "2026-01-04", 9, "", "2026-01-04 09:00:00.000");
+
+        let map = removable_by_type(&conn, "2026-01-05").unwrap();
+        // 7 plain tallies + (3 - 1) from the noted row.
+        assert_eq!(map.get(&1).copied(), Some(9));
+        assert_eq!(map.get(&2).copied(), Some(4));
+
+        // And it agrees with what the write actually takes.
+        let report = remove_tallies(&conn, 1, "2026-01-05", 1000).unwrap();
+        assert_eq!(report.removed, 9);
     }
 
     #[test]

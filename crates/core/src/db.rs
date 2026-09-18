@@ -149,6 +149,13 @@ impl Db {
         entries::remove_tallies(&self.conn, task_type_id, date, n)
     }
 
+    /// Per task type, how many of `date`'s tallies a removal could take. The number the
+    /// quick-add preview must show — do NOT derive this from [`Db::day_log_rows`], which is
+    /// capped at five rows.
+    pub fn removable_by_type(&self, date: &str) -> Result<std::collections::BTreeMap<i64, i64>> {
+        entries::removable_by_type(&self.conn, date)
+    }
+
     pub fn edit_entry(
         &self,
         entry_id: i64,
