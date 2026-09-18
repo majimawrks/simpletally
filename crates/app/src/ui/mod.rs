@@ -5,6 +5,7 @@ pub mod chrome;
 pub mod dialog;
 pub mod insights;
 pub mod migrate;
+pub mod quickadd;
 pub mod theme;
 pub mod today;
 pub mod types;

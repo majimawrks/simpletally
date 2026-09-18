@@ -22,7 +22,10 @@ use super::tray::Tray;
 use super::win::Win;
 use crate::service::{db_service, discovery, restore};
 
-const POPUP_BG: [f32; 3] = [0.11, 0.12, 0.14];
+/// GL clear colour behind the quick-add popup, as **linear** RGB — the framebuffer is sRGB,
+/// so these are not the hex channels. This is `#1E1E1B`, the popup's own background, so the
+/// sliver outside the painted panel on a fractional-DPI rounding can't flash a lighter rim.
+const POPUP_BG: [f32; 3] = [0.0130, 0.0130, 0.0110];
 
 /// What startup found before the UI existed: whether the live DB was just created empty
 /// (PLAN §1.5), and any other `task_tally.db` files discovery turned up elsewhere. Handed to
@@ -57,8 +60,8 @@ pub struct App {
     auto_open_migrate: bool,
     /// The resolved color theme (follows the OS light/dark setting).
     theme: crate::ui::theme::Theme,
-    /// The quick-add popup's text buffer.
-    popup_query: String,
+    /// The quick-add popup's state (query, selection, cached type list).
+    quickadd: crate::ui::quickadd::QuickAddState,
     /// Foreground window captured when the popup was summoned, restored on an explicit
     /// dismiss (Esc / hotkey) so the user returns to what they were doing. Not restored
     /// on click-away — there the user already chose a new foreground.
@@ -90,7 +93,7 @@ impl App {
             migrate: crate::ui::migrate::MigrateState::new(first_run.candidates),
             auto_open_migrate,
             theme: crate::ui::theme::resolve(None),
-            popup_query: String::new(),
+            quickadd: crate::ui::quickadd::QuickAddState::new(),
             prev_foreground: None,
             painting: false,
             startup,
@@ -268,9 +271,14 @@ impl App {
         if self.prev_foreground.is_none() {
             self.prev_foreground = super::winos::foreground_window();
         }
+        // A fresh summon starts empty: the query from last time is never what you want now,
+        // and the type list may have changed since.
+        self.quickadd.reset();
         // Paint once while hidden, then center on the active monitor and show + focus
-        // — no unpainted-frame flash, appears where the user is working.
+        // — no unpainted-frame flash, appears where the user is working. The size must be
+        // right *before* centering, or the popup lands off-centre by half the difference.
         self.paint_popup();
+        self.fit_popup();
         if let Some(p) = self.popup.as_ref() {
             super::winos::center_on_active_monitor(p.window());
             p.set_visible(true);
@@ -288,7 +296,7 @@ impl App {
         if let Some(p) = self.popup.as_ref() {
             p.set_visible(false);
         }
-        self.popup_query.clear();
+        self.quickadd.reset();
         let prev = self.prev_foreground.take();
         if restore_focus {
             if let Some(h) = prev {
@@ -313,7 +321,8 @@ impl App {
         }
     }
 
-    /// Paint one popup frame. Returns true if the user asked to dismiss (Esc).
+    /// Paint one popup frame. Returns true if the popup should close — Esc, or a tally that
+    /// was logged (quick add's whole point is log-and-dismiss without raising the app).
     fn paint_popup(&mut self) -> bool {
         if self.painting {
             if let Some(p) = self.popup.as_ref() {
@@ -322,31 +331,63 @@ impl App {
             return false;
         }
         self.painting = true;
-        let mut query = std::mem::take(&mut self.popup_query);
-        let mut dismiss = false;
+
+        // Disjoint field borrows: `paint` takes `&mut self.popup` while the closure needs
+        // `&self.db` and `&mut self.quickadd`, which the borrow checker only allows as
+        // separate locals (same pattern as `redraw_main`).
+        let db = &self.db;
+        let quickadd = &mut self.quickadd;
+        let today = chrono::Local::now().date_naive();
+        let mut logged = None;
+        let mut close = false;
+
         if let Some(win) = self.popup.as_mut() {
             win.next_repaint = None;
             win.paint(POPUP_BG, |ui| {
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    dismiss = true;
+                match crate::ui::quickadd::show(ui, quickadd, db, today) {
+                    crate::ui::quickadd::Action::None => {}
+                    crate::ui::quickadd::Action::Dismiss => close = true,
+                    crate::ui::quickadd::Action::Logged(line) => {
+                        logged = Some(line);
+                        close = true;
+                    }
                 }
-                ui.add_space(6.0);
-                ui.label("Quick add — Phase 0 popup (independent second window)");
-                ui.add_space(6.0);
-                let te = ui.text_edit_singleline(&mut query);
-                te.request_focus();
-                ui.add_space(4.0);
-                ui.small("Esc to dismiss · Ctrl+Shift+T toggles");
             });
         }
         self.painting = false;
-        self.popup_query = query;
-        dismiss
+
+        if logged.is_some() {
+            // The write landed behind the other screens' cached views; they must re-query
+            // before they are next shown, exactly as a write from the Task types screen does.
+            self.today.mark_dirty();
+            self.insights.mark_dirty();
+        }
+        close
+    }
+
+    /// Size the popup window to the rows it currently shows. Called after painting, so the
+    /// height reflects the result list the user just filtered to.
+    fn fit_popup(&mut self) {
+        let Some(p) = self.popup.as_ref() else { return };
+        let size = LogicalSize::new(
+            crate::ui::quickadd::WIDTH as f64,
+            crate::ui::quickadd::height_for(&self.quickadd) as f64,
+        );
+        let scale = p.window().scale_factor();
+        if p.window().inner_size() != size.to_physical(scale) {
+            let _ = p.window().request_inner_size(size);
+        }
     }
 
     fn redraw_popup(&mut self) {
-        if self.paint_popup() {
-            self.hide_popup(true); // Esc — return focus
+        let close = self.paint_popup();
+        // Grow/shrink to the filtered list before the next frame. Only while it's on screen:
+        // a resize of a hidden window would fight `show_popup`'s own fit-then-centre.
+        if !close {
+            self.fit_popup();
+        }
+        if close {
+            self.hide_popup(true); // Esc or a logged tally — return focus to where they were
         }
     }
 }
@@ -371,7 +412,11 @@ impl ApplicationHandler<UserEvent> for App {
         // The popup is a borderless, taskbar-hidden window (keeps it out of Alt-Tab).
         let popup_attrs = Window::default_attributes()
             .with_title("SimpleTally — Quick add")
-            .with_inner_size(LogicalSize::new(520.0, 132.0))
+            // Starting size only; `fit_popup` resizes to the result list on every summon.
+            .with_inner_size(LogicalSize::new(
+                crate::ui::quickadd::WIDTH as f64,
+                crate::ui::quickadd::height_for(&self.quickadd) as f64,
+            ))
             .with_decorations(false)
             .with_resizable(false)
             .with_visible(false)

@@ -480,6 +480,46 @@ pub fn canvas_clear(theme: &Theme) -> [f32; 3] {
     ]
 }
 
+// --- Quick-add popup theme ---------------------------------------------------------------
+
+/// Color tokens for the quick-add popup (spec: quick-add PALETTE). Always dark, regardless
+/// of [`Mode`] — the popup is a floating overlay, not part of the app's light/dark surface,
+/// so it gets its own fixed palette rather than reusing [`Theme`]'s tokens.
+#[derive(Debug, Clone, Copy)]
+pub struct PopupTheme {
+    pub bg: egui::Color32,
+    pub border: egui::Color32,
+    pub divider: egui::Color32,
+    pub footer_bg: egui::Color32,
+    pub query_text: egui::Color32,
+    pub muted_text: egui::Color32,
+    pub accent: egui::Color32,
+    pub badge_glyph: egui::Color32,
+    pub row_selected_bg: egui::Color32,
+    pub row_selected_border: egui::Color32,
+    pub row_name: egui::Color32,
+    pub row_category: egui::Color32,
+}
+
+/// The quick-add popup's fixed palette.
+pub fn popup() -> PopupTheme {
+    use egui::Color32 as C;
+    PopupTheme {
+        bg: C::from_rgb(0x1E, 0x1E, 0x1B),
+        border: C::from_rgb(0x35, 0x35, 0x2F),
+        divider: C::from_rgb(0x2C, 0x2C, 0x27),
+        footer_bg: C::from_rgb(0x19, 0x19, 0x16),
+        query_text: C::from_rgb(0xF2, 0xF1, 0xEC),
+        muted_text: C::from_rgb(0x6D, 0x6A, 0x62),
+        accent: C::from_rgb(0x4F, 0xB3, 0x7D),
+        badge_glyph: C::from_rgb(0x10, 0x23, 0x1A),
+        row_selected_bg: C::from_rgb(0x24, 0x32, 0x2B),
+        row_selected_border: C::from_rgb(0x35, 0x57, 0x3F),
+        row_name: C::from_rgb(0xF2, 0xF1, 0xEC),
+        row_category: C::from_rgb(0x6D, 0x6A, 0x62),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
