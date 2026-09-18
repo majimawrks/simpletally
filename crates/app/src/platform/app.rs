@@ -123,15 +123,13 @@ fn restore_from_settings(settings: &Settings, today: chrono::NaiveDate) -> Resto
 
     // Reopening the app tomorrow morning must never silently resume yesterday's date —
     // Today's whole point is logging against *today*, and a stale carried-over date would
-    // put tallies on the wrong day with no visible cue. Restore only an exact same-day
-    // match; anything else (missing, unparseable, or genuinely a different day) falls back
-    // to today.
-    let selected_date = settings
-        .selected_date
-        .as_deref()
-        .and_then(parse_sql)
-        .filter(|d| *d == today)
-        .unwrap_or(today);
+    // put tallies on the wrong day with no visible cue. Pinning to another date is now a
+    // within-session decision (`TodayState::following_today`/`pinned_on`), never persisted:
+    // a pinned date restored from a *previous* launch is exactly the stale-date bug this
+    // guards against, so launch always follows today rather than restoring `selected_date`
+    // at all. The field is still read from and written to `settings.toml` below, only for
+    // file compatibility with older versions of the file.
+    let selected_date = today;
 
     let filter = match settings.selected_category {
         Some(id) => crate::ui::today::CategoryFilter::One(id),

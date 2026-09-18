@@ -25,6 +25,18 @@ pub enum CategoryFilter {
 
 pub struct TodayState {
     pub selected_date: NaiveDate,
+    /// True while Today tracks the real calendar date frame-to-frame (the normal state).
+    /// False once `‹ Prev`/`Next ›` pins to an explicit date; `Today` restores it. Driving
+    /// writes off this instead of `selected_date` alone is what lets a per-frame snap-to-
+    /// today coexist with a deliberately pinned date (see `show`'s snap check and `plan_for`).
+    pub following_today: bool,
+    /// The real calendar date on the day the current pin was made (not the date pinned to).
+    /// `None` while following. Used to notice a day change under a stale pin: if it no longer
+    /// equals "today" when a write is attempted, the pin's intent needs to be renewed first.
+    pub pinned_on: Option<NaiveDate>,
+    /// A write gesture landed on a stale pin and was consumed instead of written; the banner
+    /// is showing the renewal question until `Use today`/`Continue with <date>` resolves it.
+    asking: bool,
     pub filter: CategoryFilter,
     pub note_open: bool,
     /// Collapses the day-log band to its newest row, handing the space to the tile grid.
@@ -76,6 +88,9 @@ impl TodayState {
     pub fn new() -> Self {
         Self {
             selected_date: Local::now().date_naive(),
+            following_today: true,
+            pinned_on: None,
+            asking: false,
             filter: CategoryFilter::All,
             note_open: false,
             log_collapsed: false,
@@ -130,6 +145,42 @@ impl TodayState {
             self.last_action = None;
             self.mark_dirty();
         }
+    }
+
+    /// The automatic midnight/clock-change advance, as opposed to [`set_date`]'s user-driven
+    /// move. **Keeps `pending_note`.**
+    ///
+    /// PLAN §6 discards an abandoned note when the date changes, but that rule is about the
+    /// user *leaving* — pressing `‹ Prev`, or the `Today` pill. Rolling over at midnight is
+    /// something the app does on its own, and wiping half-typed text the user is still looking
+    /// at would be silent loss of the only content here they can't retype from memory. The
+    /// note does end up attached to the new day if they then tally, which is a real trade-off
+    /// — but it is visible in the field and they can edit or clear it, where a wipe is not
+    /// recoverable.
+    fn advance_to(&mut self, today: NaiveDate) {
+        if today != self.selected_date {
+            self.selected_date = today;
+            self.last_action = None;
+            self.mark_dirty();
+        }
+    }
+
+    /// `Today` pill / `Return to today` link / `Use today` renewal answer: go back to
+    /// following the real calendar date.
+    fn resume_following(&mut self, today: NaiveDate) {
+        self.following_today = true;
+        self.pinned_on = None;
+        self.asking = false;
+        self.set_date(today);
+    }
+
+    /// `‹ Prev` / `Next ›`: pin to an explicit date. `pinned_on` records *today*, the day the
+    /// pin was made — not `date` — so a later frame can tell whether the calendar has since
+    /// rolled over on a pin that's still in effect.
+    fn pin_to(&mut self, date: NaiveDate, today: NaiveDate) {
+        self.following_today = false;
+        self.pinned_on = Some(today);
+        self.set_date(date);
     }
 
     /// Rebuild `view` from the DB if dirty. Errors are captured into `error` and shown.
@@ -205,6 +256,75 @@ fn date_headline(d: NaiveDate) -> String {
     .to_uppercase()
 }
 
+/// `17 Sep 2026` — the compact form used in the pinned-date banner (the full uppercase
+/// headline reads as shouting for a one-line status message).
+fn short_date(d: NaiveDate) -> String {
+    format!("{} {} {}", d.day(), d.format("%b"), d.year())
+}
+
+/// `17 Sep` — same, without the year, for the renewal banner's "Continue with …" button
+/// (the year is redundant right next to "Still logging to <date with year>?").
+fn short_date_no_year(d: NaiveDate) -> String {
+    format!("{} {}", d.day(), d.format("%b"))
+}
+
+/// What today's per-frame date snap and this frame's write gestures should do, given the
+/// follow/pin state and the real calendar date. Pure and DB/window-free so the stale-date
+/// rules (PLAN: date-handling redesign) are unit-testable directly — see the tests module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatePlan {
+    /// Following today, but `selected_date` has drifted from it (day rolled over, or a
+    /// backward clock correction moved `today` under a stale `selected_date`) — snap before
+    /// rendering, unconditionally, not just on a write.
+    Snap,
+    /// Pinned to a date whose pin was made on an earlier calendar day: the pin's intent is
+    /// stale. A write must not go through silently; ask the user to renew it first.
+    Ask,
+    /// Safe to write to `selected_date` as-is.
+    AllowWrite,
+    /// `selected_date` itself is in the future (only reachable via a backward clock change
+    /// while pinned — `Next ›` already refuses to pin past today).
+    RefuseFuture,
+}
+
+fn plan_for(
+    following_today: bool,
+    selected_date: NaiveDate,
+    pinned_on: Option<NaiveDate>,
+    today: NaiveDate,
+) -> DatePlan {
+    if following_today {
+        // `!=`, never `<`/`>`: a clock correction or timezone change can move `today`
+        // backwards, and the snap must still fire rather than get stuck comparing the wrong
+        // way.
+        return if selected_date != today { DatePlan::Snap } else { DatePlan::AllowWrite };
+    }
+    if refuse_future(selected_date, today).is_some() {
+        return DatePlan::RefuseFuture;
+    }
+    if pinned_on != Some(today) {
+        return DatePlan::Ask;
+    }
+    DatePlan::AllowWrite
+}
+
+/// The shared future-date guard (date-handling redesign, item 4): every interactive write
+/// path in this file routes through this before it reaches the DB — the tile tally and the
+/// number keys and the right-click remove via `plan_for`'s `RefuseFuture` case, and the edit
+/// dialog's free-text date field directly, since that date isn't `selected_date` at all.
+///
+/// Deliberately not in `simpletally_core`: core stays time-agnostic on purpose, because a
+/// v3.8 migration import or a backup restore may legitimately carry any date, and rejecting
+/// future dates in core would make those paths fail. "No future dates" is a rule about
+/// interactive entry, not about stored data, so it belongs at this UI submission boundary.
+fn refuse_future(date: NaiveDate, today: NaiveDate) -> Option<String> {
+    if date > today {
+        Some(format!("Can't log to {} — that hasn't happened yet.", short_date(date)))
+    } else {
+        None
+    }
+}
+
 /// Render the Today screen and apply any interaction to the DB. `hotkey_error`, if present,
 /// is surfaced as a banner (PLAN §1.2: registration failure must be visible).
 pub fn show(
@@ -215,6 +335,14 @@ pub fn show(
     hotkey_error: Option<&str>,
 ) {
     use crate::ui::theme as t;
+    let today = Local::now().date_naive();
+    // The window can be left open across midnight, hidden to tray overnight and restored, or
+    // resumed from sleep — none of those fire a visibility hook, so this has to be a plain
+    // per-frame check, not something triggered on window-show. `set_date` no-ops when the
+    // date hasn't actually moved, so this costs nothing once you're already caught up.
+    if state.following_today {
+        state.advance_to(today);
+    }
     state.ensure_view(db);
 
     if let Some(err) = &state.error {
@@ -272,7 +400,7 @@ pub fn show(
         }
     };
 
-    let is_today = state.selected_date >= Local::now().date_naive();
+    let is_today = state.selected_date >= today;
     let mut action: Option<Action> = None;
     let mut open_edit: Option<DayLogRow> = None;
 
@@ -416,15 +544,17 @@ pub fn show(
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     if pill::nav_pill(ui, theme, "Next ›", !is_today).clicked() {
-                        state.set_date(state.selected_date.succ_opt().unwrap_or(state.selected_date));
+                        let d = state.selected_date.succ_opt().unwrap_or(state.selected_date);
+                        state.pin_to(d, today);
                     }
                     ui.add_space(6.0);
                     if pill::nav_pill(ui, theme, "Today", true).clicked() {
-                        state.set_date(Local::now().date_naive());
+                        state.resume_following(today);
                     }
                     ui.add_space(6.0);
                     if pill::nav_pill(ui, theme, "‹ Prev", true).clicked() {
-                        state.set_date(state.selected_date.pred_opt().unwrap_or(state.selected_date));
+                        let d = state.selected_date.pred_opt().unwrap_or(state.selected_date);
+                        state.pin_to(d, today);
                     }
                 });
             });
@@ -480,6 +610,62 @@ pub fn show(
         .fill(theme.bg_canvas)
         .inner_margin(pad(34, 12))
         .show(&mut central_ui, |ui| {
+            // Persistent banner while pinned (date-handling redesign, item 2/3): context, not
+            // an error — the date header alone isn't enough since tallying is a one-click
+            // habit that doesn't stop to read it.
+            if !state.following_today {
+                ui.horizontal(|ui| {
+                    if state.asking {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Still logging to {}?",
+                                short_date(state.selected_date)
+                            ))
+                            .font(t::sans(t::BODY))
+                            .color(theme.text_secondary),
+                        );
+                        ui.add_space(10.0);
+                        if link(ui, "Use today", theme.accent, t::sans(t::CAPTION)).clicked() {
+                            state.resume_following(today);
+                        }
+                        ui.add_space(10.0);
+                        if link(
+                            ui,
+                            &format!("Continue with {}", short_date_no_year(state.selected_date)),
+                            theme.accent,
+                            t::sans(t::CAPTION),
+                        )
+                        .clicked()
+                        {
+                            state.pinned_on = Some(today);
+                            state.asking = false;
+                        }
+                    } else if let Some(msg) = refuse_future(state.selected_date, today) {
+                        // Self-heal: a backward clock change while pinned can leave
+                        // `selected_date` in the future. Never silently redirect — say so
+                        // and let `Return to today` fix it.
+                        ui.label(
+                            egui::RichText::new(msg).font(t::sans(t::BODY)).color(theme.text_secondary),
+                        );
+                        ui.add_space(10.0);
+                        if link(ui, "Return to today", theme.accent, t::sans(t::CAPTION)).clicked() {
+                            state.resume_following(today);
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!("Logging to {}", short_date(state.selected_date)))
+                                .font(t::sans(t::BODY))
+                                .color(theme.text_secondary),
+                        );
+                        ui.add_space(10.0);
+                        if link(ui, "Return to today", theme.accent, t::sans(t::CAPTION)).clicked() {
+                            state.resume_following(today);
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+            }
+
             ui.horizontal(|ui| {
                 let toggle = if state.note_open { "− hide note field" } else { "+ add a note" };
                 if ui.add(egui::Button::new(egui::RichText::new(toggle).font(t::sans(t::BODY)).color(theme.accent)).frame(false)).clicked() {
@@ -573,7 +759,26 @@ pub fn show(
     }
 
     if let Some(a) = action {
-        apply(state, db, a);
+        // Shared write guard (date-handling redesign, items 3/4): route every tally/remove
+        // gesture through the same follow/pin/future decision the per-frame snap above used,
+        // instead of writing straight to `selected_date`.
+        match plan_for(state.following_today, state.selected_date, state.pinned_on, today) {
+            DatePlan::AllowWrite => apply(state, db, a),
+            DatePlan::Ask => {
+                // Consume the gesture without writing; the banner turns into the renewal
+                // question above. Repeated gestures while it's showing stay consumed too —
+                // asked once per day change, not once per tally.
+                state.asking = true;
+            }
+            DatePlan::RefuseFuture => {
+                if let Some(msg) = refuse_future(state.selected_date, today) {
+                    state.last_action = Some(msg);
+                }
+            }
+            // Following-today was already snapped to `today` above this frame, so this can't
+            // actually be reached here — but stay safe rather than write to a stale date.
+            DatePlan::Snap => {}
+        }
     }
 }
 
@@ -610,7 +815,8 @@ fn edit_dialog(
     let mut want_save = false;
     let mut want_delete = false;
     let mut want_cancel = false;
-    let today = date_sql(Local::now().date_naive());
+    let today_date = Local::now().date_naive();
+    let today = date_sql(today_date);
 
     // Scope the mutable borrow of the form to the modal render; the DB calls below re-borrow.
     {
@@ -884,6 +1090,22 @@ fn edit_dialog(
         let f = state.editing.as_ref().expect("editing is Some");
         (f.entry_id, f.task_type_id, f.date.clone(), f.count, f.notes.clone())
     };
+    // Shared future-date guard (date-handling redesign, item 4): this free-text field is the
+    // one write path that isn't `selected_date` at all, so it goes through `refuse_future`
+    // directly rather than via `plan_for`. Only Save writes a date; Delete removes whatever
+    // is already there regardless of when it happened.
+    if want_save {
+        if let Some(parsed) = simpletally_core::dates::parse_sql(&date) {
+            if let Some(msg) = refuse_future(parsed, today_date) {
+                if let Some(f) = state.editing.as_mut() {
+                    f.error = Some(msg);
+                }
+                return;
+            }
+        }
+        // An unparseable date falls through to `db.edit_entry`, whose own validation error
+        // surfaces below — same as any other invalid input in this field.
+    }
     let result = if want_delete {
         db.delete_entry(id)
     } else {
@@ -1123,5 +1345,101 @@ fn apply(state: &mut TodayState, db: &Db, action: Action) {
             }
             Err(e) => state.error = Some(e.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod date_handling_tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn following_day_rollover_snaps() {
+        let today = d(2026, 9, 18);
+        let yesterday = d(2026, 9, 17);
+        assert_eq!(plan_for(true, yesterday, None, today), DatePlan::Snap);
+    }
+
+    /// The automatic rollover must not eat a half-typed note; only a *user* date change does
+    /// (PLAN §6). Losing text nobody can retype is worse than carrying it to the new day,
+    /// where it stays visible and editable.
+    #[test]
+    fn the_automatic_advance_keeps_a_pending_note_but_set_date_clears_it() {
+        let mut s = TodayState::new();
+        s.selected_date = d(2026, 9, 17);
+        s.pending_note = "half typed".to_string();
+
+        s.advance_to(d(2026, 9, 18));
+        assert_eq!(s.selected_date, d(2026, 9, 18));
+        assert_eq!(s.pending_note, "half typed", "midnight must not discard the draft");
+
+        s.set_date(d(2026, 9, 19));
+        assert!(s.pending_note.is_empty(), "a user-driven move still discards it");
+    }
+
+    #[test]
+    fn following_same_day_is_unchanged() {
+        let today = d(2026, 9, 18);
+        assert_eq!(plan_for(true, today, None, today), DatePlan::AllowWrite);
+    }
+
+    #[test]
+    fn pinned_same_day_allows_write_without_asking() {
+        let today = d(2026, 9, 18);
+        let pinned_date = d(2026, 9, 10);
+        assert_eq!(plan_for(false, pinned_date, Some(today), today), DatePlan::AllowWrite);
+    }
+
+    #[test]
+    fn pinned_after_day_rollover_asks_and_refuses_write() {
+        let pin_made_on = d(2026, 9, 17);
+        let today = d(2026, 9, 18);
+        let pinned_date = d(2026, 9, 10);
+        assert_eq!(plan_for(false, pinned_date, Some(pin_made_on), today), DatePlan::Ask);
+    }
+
+    #[test]
+    fn continue_with_pinned_date_stops_asking_for_the_rest_of_the_day() {
+        // Simulates the "Continue with <date>" answer: `pinned_on` renews to today, so the
+        // *next* gesture no longer asks.
+        let today = d(2026, 9, 18);
+        let pinned_date = d(2026, 9, 10);
+        assert_eq!(plan_for(false, pinned_date, Some(today), today), DatePlan::AllowWrite);
+    }
+
+    #[test]
+    fn use_today_resumes_following() {
+        let today = d(2026, 9, 18);
+        let mut state = TodayState::new();
+        state.pin_to(d(2026, 9, 10), d(2026, 9, 17));
+        state.asking = true;
+
+        state.resume_following(today);
+
+        assert!(state.following_today);
+        assert_eq!(state.pinned_on, None);
+        assert!(!state.asking);
+        assert_eq!(state.selected_date, today);
+    }
+
+    #[test]
+    fn future_date_is_refused_by_the_shared_guard() {
+        let today = d(2026, 9, 18);
+        let future = d(2026, 9, 19);
+        // The guard the edit dialog's free-text Save calls directly (item 4's fourth site).
+        assert!(refuse_future(future, today).is_some());
+        // The same guard, reached through `plan_for`, for a pinned date that's gone future
+        // (item 4's self-heal case).
+        assert_eq!(plan_for(false, future, Some(today), today), DatePlan::RefuseFuture);
+    }
+
+    #[test]
+    fn backward_clock_change_while_following_snaps_instead_of_getting_stuck() {
+        let today = d(2026, 9, 18);
+        let selected_ahead_of_today = d(2026, 9, 20); // clock ran ahead, then corrected back
+        assert_eq!(plan_for(true, selected_ahead_of_today, None, today), DatePlan::Snap);
     }
 }
