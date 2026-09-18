@@ -51,6 +51,29 @@ impl RangeKind {
             RangeKind::Custom => "range",
         }
     }
+
+    /// The string persisted in `Settings::range_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeKind::Week => "week",
+            RangeKind::Month => "month",
+            RangeKind::Quarter => "quarter",
+            RangeKind::Year => "year",
+            RangeKind::Custom => "custom",
+        }
+    }
+
+    /// Inverse of [`RangeKind::as_str`]. An unrecognised value (a hand-edited or
+    /// older-version settings file) falls back to `Week` rather than failing to load.
+    pub fn from_str(s: &str) -> RangeKind {
+        match s {
+            "month" => RangeKind::Month,
+            "quarter" => RangeKind::Quarter,
+            "year" => RangeKind::Year,
+            "custom" => RangeKind::Custom,
+            _ => RangeKind::Week,
+        }
+    }
 }
 
 pub struct InsightsState {
@@ -687,6 +710,21 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    // -- RangeKind string round-trip --
+
+    #[test]
+    fn range_kind_string_round_trips() {
+        for k in RangeKind::ALL {
+            assert_eq!(RangeKind::from_str(k.as_str()), k);
+        }
+    }
+
+    #[test]
+    fn range_kind_from_str_falls_back_to_week_on_unknown() {
+        assert_eq!(RangeKind::from_str("nonsense"), RangeKind::Week);
+        assert_eq!(RangeKind::from_str(""), RangeKind::Week);
     }
 
     // -- resolve_range --

@@ -73,6 +73,12 @@ pub enum Outcome {
     Failed(String),
     /// Import succeeded; the live DB now holds the imported data.
     Imported { task_types: usize, total_tallies: i64 },
+    /// The import is about to run. The database lives on the main thread (PHASE0 gate #3,
+    /// decided), so the whole window freezes for its duration — this state is painted and
+    /// presented for one frame *before* the work starts, so the freeze reads as "working"
+    /// rather than as a hang. Without it the user clicks Import and the previous frame just
+    /// sits there.
+    Importing,
 }
 
 pub struct MigrateState {
@@ -152,6 +158,23 @@ pub fn show(ui: &mut egui::Ui, state: &mut MigrateState, theme: &Theme, exe_dir:
         ui.add_space(8.0);
 
         match &state.outcome {
+            Outcome::Importing => {
+                ui.label(
+                    egui::RichText::new("Importing\u{2026}")
+                        .font(t::sans_medium(t::BODY))
+                        .color(theme.text_primary),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Copying, checking and swapping in the file. The window won't respond \
+                         until it finishes.",
+                    )
+                    .font(t::sans(t::CAPTION))
+                    .color(theme.text_quiet),
+                );
+                ui.add_space(10.0);
+            }
             Outcome::Imported { task_types, total_tallies } => {
                 ui.label(
                     egui::RichText::new(format!(

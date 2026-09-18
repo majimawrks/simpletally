@@ -17,7 +17,7 @@ use simpletally_core::entries::RemoveOutcome;
 use simpletally_core::{Category, Db, TaskType};
 
 /// Which category the tile grid is filtered to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryFilter {
     All,
     One(i64),

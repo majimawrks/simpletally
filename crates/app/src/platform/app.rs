@@ -2,10 +2,10 @@
 //! runs their egui passes, and schedules repaints. Wake-up contract per PHASE0 gate
 //! item 2; multi-window GL discipline per gate item 5.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::platform::windows::WindowAttributesExtWindows;
@@ -20,7 +20,8 @@ use super::hotkey::Hotkey;
 use super::icon;
 use super::tray::Tray;
 use super::win::Win;
-use crate::service::{db_service, discovery, restore};
+use crate::service::settings::Settings;
+use crate::service::{db_service, discovery, restore, settings};
 
 /// GL clear colour behind the quick-add popup, as **linear** RGB — the framebuffer is sRGB,
 /// so these are not the hex channels. This is `#1E1E1B`, the popup's own background, so the
@@ -73,11 +74,164 @@ pub struct App {
     /// What this launch should surface once windows exist (Main, or QuickAdd for a
     /// `--quick-add` cold start).
     startup: ActivationTarget,
+
+    // --- settings persistence (PLAN §5) ------------------------------------
+    /// Beside the executable; `None` if it couldn't be resolved (e.g. no parent dir for
+    /// the running exe), in which case settings are silently never loaded or saved rather
+    /// than treated as fatal — same stance as `settings::load` itself.
+    settings_path: Option<PathBuf>,
+    /// The raw theme preference (Light/Dark/System), as opposed to `theme` which is the
+    /// already-resolved color set. There's no UI to change this yet, so it only ever
+    /// reflects what was loaded at startup, but it's what gets written back.
+    theme_pref: settings::Theme,
+    /// What `settings.toml` held after the last successful load or save, used to detect
+    /// "did anything actually change" before writing (`Settings` derives `PartialEq`).
+    last_saved_settings: Settings,
+    last_save_at: Instant,
+    /// Logged to stderr at most once per failure streak, so a persistently unwritable
+    /// settings path (read-only install dir) doesn't spam the log every throttle tick.
+    settings_save_error_logged: bool,
+    /// The geometry loaded from settings, applied once the main window is created in
+    /// `resumed` (nothing to apply it to before then) and cleared after.
+    pending_geometry: Option<settings::WindowGeometry>,
+    /// An import the user asked for, run at the *end* of the next frame so the migration
+    /// modal's "Importing…" state reaches the screen before the main thread blocks on it.
+    pending_import: Option<PathBuf>,
+}
+
+/// Minimum time between settings writes. Dragging or resizing the main window would
+/// otherwise ask to save every single frame; this throttles that to one write per tick.
+const SETTINGS_SAVE_THROTTLE: Duration = Duration::from_secs(2);
+
+/// Everything restorable from `Settings` without touching a window or the database —
+/// kept as a pure function of `(Settings, today)` so the "never resume yesterday's date"
+/// rule and the various fallbacks can be unit-tested without standing up winit or SQLite.
+struct Restored {
+    tab: crate::ui::chrome::Tab,
+    filter: crate::ui::today::CategoryFilter,
+    note_open: bool,
+    range_kind: crate::ui::insights::RangeKind,
+    range_anchor: chrono::NaiveDate,
+    custom_range_from: String,
+    custom_range_to: String,
+    theme_mode: Option<crate::ui::theme::Mode>,
+    selected_date: chrono::NaiveDate,
+}
+
+fn restore_from_settings(settings: &Settings, today: chrono::NaiveDate) -> Restored {
+    use simpletally_core::dates::{parse_sql, to_sql};
+
+    // Reopening the app tomorrow morning must never silently resume yesterday's date —
+    // Today's whole point is logging against *today*, and a stale carried-over date would
+    // put tallies on the wrong day with no visible cue. Restore only an exact same-day
+    // match; anything else (missing, unparseable, or genuinely a different day) falls back
+    // to today.
+    let selected_date = settings
+        .selected_date
+        .as_deref()
+        .and_then(parse_sql)
+        .filter(|d| *d == today)
+        .unwrap_or(today);
+
+    let filter = match settings.selected_category {
+        Some(id) => crate::ui::today::CategoryFilter::One(id),
+        None => crate::ui::today::CategoryFilter::All,
+    };
+
+    let range_anchor = settings
+        .range_anchor
+        .as_deref()
+        .and_then(parse_sql)
+        .unwrap_or(today);
+    let custom_range_from = settings
+        .custom_range_from
+        .clone()
+        .unwrap_or_else(|| to_sql(today));
+    let custom_range_to = settings
+        .custom_range_to
+        .clone()
+        .unwrap_or_else(|| to_sql(today));
+
+    let theme_mode = match settings.theme {
+        settings::Theme::Light => Some(crate::ui::theme::Mode::Light),
+        settings::Theme::Dark => Some(crate::ui::theme::Mode::Dark),
+        settings::Theme::System => None,
+    };
+
+    Restored {
+        tab: crate::ui::chrome::Tab::from_str(&settings.active_tab),
+        filter,
+        note_open: settings.note_field_open,
+        range_kind: crate::ui::insights::RangeKind::from_str(&settings.range_kind),
+        range_anchor,
+        custom_range_from,
+        custom_range_to,
+        theme_mode,
+        selected_date,
+    }
+}
+
+/// A plain rectangle (no winit/DPI types), so the monitor-intersection test can be
+/// unit-tested without an `ActiveEventLoop`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl Rect {
+    fn right(self) -> i64 {
+        self.x as i64 + self.width as i64
+    }
+
+    fn bottom(self) -> i64 {
+        self.y as i64 + self.height as i64
+    }
+
+    fn intersects(self, other: Rect) -> bool {
+        (self.x as i64) < other.right()
+            && self.right() > other.x as i64
+            && (self.y as i64) < other.bottom()
+            && self.bottom() > other.y as i64
+    }
+}
+
+/// Whether `saved` (a settings-file window rect) should be kept, i.e. it overlaps at
+/// least one currently-attached monitor. An empty monitor list means the caller couldn't
+/// enumerate any — keep the saved geometry rather than discard it, since we have no
+/// evidence it's actually offscreen.
+fn geometry_fits_a_monitor(saved: Rect, monitors: &[Rect]) -> bool {
+    if monitors.is_empty() {
+        return true;
+    }
+    monitors.iter().any(|m| saved.intersects(*m))
 }
 
 impl App {
     pub fn new(proxy: EventLoopProxy<UserEvent>, startup: ActivationTarget, db: Db, first_run: FirstRun) -> Self {
         let auto_open_migrate = crate::ui::migrate::should_auto_open(first_run.created_empty);
+
+        let settings_path = db_service::settings_path().ok();
+        let loaded_settings = settings_path
+            .as_ref()
+            .map(|p| settings::load(p))
+            .unwrap_or_default();
+        let today = chrono::Local::now().date_naive();
+        let restored = restore_from_settings(&loaded_settings, today);
+
+        let mut today_state = crate::ui::today::TodayState::new();
+        today_state.selected_date = restored.selected_date;
+        today_state.filter = restored.filter;
+        today_state.note_open = restored.note_open;
+
+        let mut insights_state = crate::ui::insights::InsightsState::new(today);
+        insights_state.kind = restored.range_kind;
+        insights_state.anchor = restored.range_anchor;
+        insights_state.custom_from = restored.custom_range_from;
+        insights_state.custom_to = restored.custom_range_to;
+
         Self {
             proxy,
             main: None,
@@ -86,17 +240,24 @@ impl App {
             hotkey: None,
             hotkey_error: None,
             db,
-            today: crate::ui::today::TodayState::new(),
-            insights: crate::ui::insights::InsightsState::new(chrono::Local::now().date_naive()),
+            today: today_state,
+            insights: insights_state,
             types: crate::ui::types::TypesState::new(),
-            tab: crate::ui::chrome::Tab::default(),
+            tab: restored.tab,
             migrate: crate::ui::migrate::MigrateState::new(first_run.candidates),
             auto_open_migrate,
-            theme: crate::ui::theme::resolve(None),
+            theme: crate::ui::theme::resolve(restored.theme_mode),
             quickadd: crate::ui::quickadd::QuickAddState::new(),
             prev_foreground: None,
             painting: false,
             startup,
+            settings_path,
+            theme_pref: loaded_settings.theme,
+            pending_geometry: loaded_settings.main_window_geometry,
+            pending_import: None,
+            last_saved_settings: loaded_settings,
+            last_save_at: Instant::now(),
+            settings_save_error_logged: false,
         }
     }
 
@@ -111,10 +272,14 @@ impl App {
         }
     }
 
-    fn hide_main(&self) {
+    fn hide_main(&mut self) {
         if let Some(w) = self.main.as_ref() {
             w.set_visible(false);
         }
+        // Hiding to tray is a common "exit" from the user's point of view — flush
+        // unconditionally rather than leave up to 2s of state (PLAN §5) sitting unsaved
+        // behind the throttle.
+        self.flush_settings();
     }
 
     fn redraw_main(&mut self) {
@@ -182,8 +347,20 @@ impl App {
         }
         self.painting = false;
 
-        if let crate::ui::migrate::Action::Import(chosen) = migrate_action {
+        // Order matters. A requested import runs only on the frame *after* it was asked for,
+        // so the `Importing…` state set below has been painted and presented first. The DB is
+        // on the main thread (PHASE0 gate #3), so this call freezes the window for its whole
+        // duration; without the earlier frame the user would just see the pre-click frame
+        // sitting there, indistinguishable from a hang.
+        if let Some(chosen) = self.pending_import.take() {
             self.handle_migrate_import(chosen);
+        }
+        if let crate::ui::migrate::Action::Import(chosen) = migrate_action {
+            self.migrate.outcome = crate::ui::migrate::Outcome::Importing;
+            self.pending_import = Some(chosen);
+            if let Some(m) = self.main.as_ref() {
+                m.window().request_redraw();
+            }
         }
     }
 
@@ -390,6 +567,85 @@ impl App {
             self.hide_popup(true); // Esc or a logged tally — return focus to where they were
         }
     }
+
+    // --- settings persistence -----------------------------------------------
+
+    /// The main window's current outer position + inner size, in physical pixels (matching
+    /// what `resumed` feeds back in via `with_position`/`with_inner_size`). `None` before the
+    /// window exists or if the platform can't report a position (matches
+    /// `Settings::main_window_geometry`'s own doc: "`None` until shown and moved/resized").
+    fn current_geometry(&self) -> Option<settings::WindowGeometry> {
+        let w = self.main.as_ref()?.window();
+        let pos = w.outer_position().ok()?;
+        let size = w.inner_size();
+        Some(settings::WindowGeometry { x: pos.x, y: pos.y, width: size.width, height: size.height })
+    }
+
+    /// Build a `Settings` snapshot from the app's current state.
+    fn current_settings(&self) -> Settings {
+        use simpletally_core::dates::to_sql;
+        let mut s = self.last_saved_settings.clone();
+        s.selected_date = Some(to_sql(self.today.selected_date));
+        s.selected_category = match self.today.filter {
+            crate::ui::today::CategoryFilter::All => None,
+            crate::ui::today::CategoryFilter::One(id) => Some(id),
+        };
+        s.theme = self.theme_pref;
+        s.range_kind = self.insights.kind.as_str().to_string();
+        s.range_anchor = Some(to_sql(self.insights.anchor));
+        s.custom_range_from = Some(self.insights.custom_from.clone());
+        s.custom_range_to = Some(self.insights.custom_to.clone());
+        s.active_tab = self.tab.as_str().to_string();
+        s.note_field_open = self.today.note_open;
+        s.main_window_geometry = self.current_geometry();
+        s
+    }
+
+    /// Save if the built-from-state `Settings` differ from what's on disk AND the throttle
+    /// has elapsed. Called once per event-loop iteration (`about_to_wait`) — cheap even at
+    /// that frequency, since it's just a struct comparison until something actually changed.
+    fn maybe_save_settings(&mut self) {
+        if Instant::now().duration_since(self.last_save_at) < SETTINGS_SAVE_THROTTLE {
+            return;
+        }
+        self.save_if_changed();
+    }
+
+    /// Save regardless of the throttle, but still only if something changed — used on the
+    /// exits where losing the last couple of seconds of state would be user-visible (hide
+    /// to tray, quit).
+    fn flush_settings(&mut self) {
+        self.save_if_changed();
+    }
+
+    fn save_if_changed(&mut self) {
+        let current = self.current_settings();
+        if current == self.last_saved_settings {
+            return;
+        }
+        let Some(path) = self.settings_path.as_ref() else { return };
+        match settings::save(&current, path) {
+            Ok(()) => {
+                self.last_saved_settings = current;
+                self.last_save_at = Instant::now();
+                self.settings_save_error_logged = false;
+            }
+            Err(e) => {
+                // Stamp the failure too, or the throttle never engages: `last_saved_settings`
+                // stays stale, so every loop iteration would see a difference and retry the
+                // write. An unwritable install dir would then mean a failing file write per
+                // frame, invisibly — the error log is one-shot.
+                self.last_save_at = Instant::now();
+                // Settings failure is not database failure (settings.rs module doc) — never
+                // fatal, and logged at most once per failure streak so a persistently
+                // unwritable path doesn't spam stderr every throttle tick.
+                if !self.settings_save_error_logged {
+                    eprintln!("warning: could not save settings to {}: {e}", path.display());
+                    self.settings_save_error_logged = true;
+                }
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -398,12 +654,31 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        let main_attrs = Window::default_attributes()
+        let mut main_attrs = Window::default_attributes()
             .with_title("SimpleTally")
             .with_inner_size(LogicalSize::new(960.0, 720.0))
             .with_min_inner_size(LogicalSize::new(820.0, 560.0))
             .with_window_icon(Some(icon::window()))
             .with_visible(false);
+        // Apply the saved geometry only if it still lands on a currently-attached monitor —
+        // unplugging a second screen since the last run must not open the window offscreen
+        // and unreachable.
+        if let Some(g) = self.pending_geometry.take() {
+            let saved = Rect { x: g.x, y: g.y, width: g.width, height: g.height };
+            let monitors: Vec<Rect> = event_loop
+                .available_monitors()
+                .map(|m| {
+                    let p = m.position();
+                    let s = m.size();
+                    Rect { x: p.x, y: p.y, width: s.width, height: s.height }
+                })
+                .collect();
+            if geometry_fits_a_monitor(saved, &monitors) {
+                main_attrs = main_attrs
+                    .with_inner_size(PhysicalSize::new(g.width, g.height))
+                    .with_position(PhysicalPosition::new(g.x, g.y));
+            }
+        }
         let main = Win::new(event_loop, main_attrs, &self.proxy);
         // Install fonts + theme on the main window's egui context, once, before first paint.
         crate::ui::theme::apply(main.egui_ctx(), &self.theme);
@@ -596,14 +871,134 @@ impl ApplicationHandler<UserEvent> for App {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         });
+
+        // Cheapest spot to check: runs once per loop iteration, not once per frame, and
+        // the check itself is just a struct comparison until something actually changed.
+        self.maybe_save_settings();
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Covers every quit route (tray "Quit", not just this one call site) — flush
+        // unconditionally so the last few seconds of state aren't lost to the throttle.
+        self.flush_settings();
         if let Some(w) = self.main.as_mut() {
             w.destroy();
         }
         if let Some(w) = self.popup.as_mut() {
             w.destroy();
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_apply_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    // -- selected_date: the "never resume yesterday" rule --
+
+    #[test]
+    fn selected_date_of_today_is_restored() {
+        let today = d(2026, 9, 18);
+        let mut s = Settings::default();
+        s.selected_date = Some("2026-09-18".to_string());
+        assert_eq!(restore_from_settings(&s, today).selected_date, today);
+    }
+
+    #[test]
+    fn selected_date_of_yesterday_falls_back_to_today() {
+        let today = d(2026, 9, 18);
+        let mut s = Settings::default();
+        s.selected_date = Some("2026-09-17".to_string());
+        assert_eq!(restore_from_settings(&s, today).selected_date, today);
+    }
+
+    #[test]
+    fn missing_or_garbage_selected_date_falls_back_to_today_without_panicking() {
+        let today = d(2026, 9, 18);
+        let mut s = Settings::default();
+        s.selected_date = None;
+        assert_eq!(restore_from_settings(&s, today).selected_date, today);
+
+        s.selected_date = Some("not-a-date".to_string());
+        assert_eq!(restore_from_settings(&s, today).selected_date, today);
+    }
+
+    // -- garbage values fall back instead of panicking --
+
+    #[test]
+    fn unknown_tab_and_range_kind_fall_back_to_defaults() {
+        let today = d(2026, 9, 18);
+        let mut s = Settings::default();
+        s.active_tab = "made_up".to_string();
+        s.range_kind = "made_up".to_string();
+        s.range_anchor = Some("garbage".to_string());
+        let r = restore_from_settings(&s, today);
+        assert_eq!(r.tab, crate::ui::chrome::Tab::Today);
+        assert_eq!(r.range_kind, crate::ui::insights::RangeKind::Week);
+        assert_eq!(r.range_anchor, today); // unparseable anchor falls back to today
+    }
+
+    #[test]
+    fn category_filter_maps_none_to_all_and_some_to_one() {
+        let today = d(2026, 9, 18);
+        let mut s = Settings::default();
+        s.selected_category = None;
+        assert_eq!(restore_from_settings(&s, today).filter, crate::ui::today::CategoryFilter::All);
+        s.selected_category = Some(42);
+        assert_eq!(
+            restore_from_settings(&s, today).filter,
+            crate::ui::today::CategoryFilter::One(42)
+        );
+    }
+
+    #[test]
+    fn theme_maps_light_dark_to_some_and_system_to_none() {
+        let today = d(2026, 9, 18);
+        let mut s = Settings::default();
+        s.theme = settings::Theme::Light;
+        assert_eq!(restore_from_settings(&s, today).theme_mode, Some(crate::ui::theme::Mode::Light));
+        s.theme = settings::Theme::Dark;
+        assert_eq!(restore_from_settings(&s, today).theme_mode, Some(crate::ui::theme::Mode::Dark));
+        s.theme = settings::Theme::System;
+        assert_eq!(restore_from_settings(&s, today).theme_mode, None);
+    }
+
+    // -- monitor-intersection test --
+
+    fn r(x: i32, y: i32, w: u32, h: u32) -> Rect {
+        Rect { x, y, width: w, height: h }
+    }
+
+    #[test]
+    fn geometry_fully_inside_one_monitor_fits() {
+        let saved = r(100, 100, 800, 600);
+        let monitors = [r(0, 0, 1920, 1080)];
+        assert!(geometry_fits_a_monitor(saved, &monitors));
+    }
+
+    #[test]
+    fn geometry_straddling_two_monitors_fits() {
+        // Second monitor starts where the first ends; the saved window straddles the seam.
+        let saved = r(1800, 100, 400, 300);
+        let monitors = [r(0, 0, 1920, 1080), r(1920, 0, 1920, 1080)];
+        assert!(geometry_fits_a_monitor(saved, &monitors));
+    }
+
+    #[test]
+    fn geometry_entirely_offscreen_does_not_fit() {
+        let saved = r(5000, 5000, 800, 600);
+        let monitors = [r(0, 0, 1920, 1080)];
+        assert!(!geometry_fits_a_monitor(saved, &monitors));
+    }
+
+    #[test]
+    fn empty_monitor_list_keeps_geometry_as_is() {
+        let saved = r(5000, 5000, 800, 600);
+        assert!(geometry_fits_a_monitor(saved, &[]));
     }
 }

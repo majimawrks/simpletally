@@ -14,6 +14,27 @@ pub enum Tab {
     TaskTypes,
 }
 
+impl Tab {
+    /// The string persisted in `Settings::active_tab`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tab::Today => "today",
+            Tab::Insights => "insights",
+            Tab::TaskTypes => "types",
+        }
+    }
+
+    /// Inverse of [`Tab::as_str`]. An unrecognised value (a hand-edited or older-version
+    /// settings file) falls back to the default tab rather than failing to load.
+    pub fn from_str(s: &str) -> Tab {
+        match s {
+            "insights" => Tab::Insights,
+            "types" => Tab::TaskTypes,
+            _ => Tab::Today,
+        }
+    }
+}
+
 /// Renders the tab strip and updates `active` on a click. Row below the title bar: 10px top
 /// padding, 22px horizontal padding. Returns the strip's bottom edge (in `ui`'s coordinate
 /// space) so the caller can hand the screen below it the remaining rect.
@@ -80,4 +101,22 @@ fn tab_button(ui: &mut egui::Ui, theme: &Theme, label: &str, active: bool) -> eg
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_string_round_trips() {
+        for t in [Tab::Today, Tab::Insights, Tab::TaskTypes] {
+            assert_eq!(Tab::from_str(t.as_str()), t);
+        }
+    }
+
+    #[test]
+    fn tab_from_str_falls_back_to_today_on_unknown() {
+        assert_eq!(Tab::from_str("nonsense"), Tab::Today);
+        assert_eq!(Tab::from_str(""), Tab::Today);
+    }
 }
