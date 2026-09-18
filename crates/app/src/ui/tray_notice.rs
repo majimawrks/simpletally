@@ -160,19 +160,19 @@ fn close_quits_switch(ui: &mut egui::Ui, theme: &Theme, on: &mut bool) -> bool {
         egui::vec2(track_w, track_h),
     );
     let anim = ui.ctx().animate_bool_with_time(ui.id().with("close_quits_switch"), *on, 0.12);
-    // The off track needs a border: `bg_track` on `bg_sunken` is nearly the same value in dark
-    // mode, and without an outline the control reads as empty space rather than a switch that
-    // happens to be off. The accent fill carries the on state by itself.
+    // Off state has to look like a control before it looks like a state: a lighter-than-any-
+    // surface track, a blue outline, and a near-white knob. Drawn from surface/border tokens
+    // it was invisible — dark track, dark knob, no edge.
     ui.painter().rect(
         track,
         egui::CornerRadius::same((track_h / 2.0) as u8),
-        if *on { theme.accent } else { theme.bg_track },
-        if *on { egui::Stroke::NONE } else { egui::Stroke::new(1.0, theme.border_strong) },
+        if *on { theme.accent } else { theme.switch_off_track },
+        if *on { egui::Stroke::NONE } else { egui::Stroke::new(1.0, theme.secondary) },
         egui::StrokeKind::Inside,
     );
     let knob_r = track_h / 2.0 - 2.0;
     let knob_x = track.left() + knob_r + 2.0 + anim * (track_w - knob_r * 2.0 - 4.0);
-    ui.painter().circle_filled(egui::pos2(knob_x, track.center().y), knob_r, theme.bg_raised);
+    ui.painter().circle_filled(egui::pos2(knob_x, track.center().y), knob_r, theme.switch_knob);
 
     // Both lines describe the CURRENT state, not the thing the switch would do. A fixed title
     // reading "Closing quits SimpleTally" above an off switch asserts the opposite of the

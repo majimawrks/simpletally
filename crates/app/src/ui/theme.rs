@@ -217,6 +217,17 @@ pub struct Theme {
     pub secondary_tint_bg: egui::Color32,
     pub secondary_tint_border: egui::Color32,
 
+    // --- switches -------------------------------------------------------------------------
+    /// The track of a switch that is **off**. Deliberately not `bg_track`: every dark-mode
+    /// surface token sits within a few steps of the canvas, so a switch drawn from one is
+    /// invisible against the panel it sits on and reads as empty space rather than a control.
+    /// This is lighter than any surface, so the control announces itself before it announces
+    /// its state. The **on** track is `accent` and needs no help.
+    pub switch_off_track: egui::Color32,
+    /// The knob, in both states. Near-white in both themes so it separates from the off track
+    /// *and* from the accent fill — `bg_raised` was dark-on-dark and vanished.
+    pub switch_knob: egui::Color32,
+
     // Selected pill
     pub pill_sel_bg: egui::Color32,
     pub pill_sel_border: egui::Color32,
@@ -279,6 +290,10 @@ impl Theme {
             secondary: C::from_rgb(0x40, 0x75, 0x9C),
             secondary_tint_bg: C::from_rgb(0xEA, 0xF0, 0xF5),
             secondary_tint_border: C::from_rgb(0xA9, 0xC3, 0xD6),
+
+            // Darker than every light-theme surface, for the same reason dark's is lighter.
+            switch_off_track: C::from_rgb(0xD2, 0xCE, 0xC5),
+            switch_knob: C::from_rgb(0xFF, 0xFF, 0xFF),
 
             pill_sel_bg: C::from_rgb(0xEA, 0xF3, 0xEE),
             pill_sel_border: C::from_rgb(0x9C, 0xC9, 0xB0),
@@ -357,6 +372,11 @@ impl Theme {
             secondary: C::from_rgb(0x51, 0x8A, 0xB3),
             secondary_tint_bg: C::from_rgb(0x1B, 0x28, 0x33),
             secondary_tint_border: C::from_rgb(0x2F, 0x4B, 0x63),
+
+            // Lighter than `bg_tab_active` (#282825), the lightest dark-theme surface, so an
+            // off switch cannot be mistaken for the panel behind it.
+            switch_off_track: C::from_rgb(0x4C, 0x4C, 0x46),
+            switch_knob: C::from_rgb(0xF2, 0xF1, 0xEC),
 
             pill_sel_bg: C::from_rgb(0x2A, 0x3A, 0x31),
             pill_sel_border: C::from_rgb(0x3B, 0x5A, 0x47),
