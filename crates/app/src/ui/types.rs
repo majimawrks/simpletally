@@ -542,23 +542,32 @@ fn toolbar(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
             }));
         }
 
-        ui.add_space(10.0);
-        if outline_button(ui, theme, &format!("Trash ({})", snap.trash.len())).clicked() {
-            state.modal = Modal::Trash(TrashModal::default());
-        }
-
         // Right-aligned by measuring and padding, not `Layout::right_to_left`: nested inside
         // this horizontal, that layout claims a rect the left-hand controls already used and
         // the two buttons land on top of "Manage categories".
-        let right_w = button_width(ui, "Import CSV") + 10.0 + button_width(ui, "New type");
+        // Icons, not labels: three text buttons plus the filters overflowed the row at the
+        // window's real width and `New type` was clipped off the right edge.
+        let right_w = CTRL_H * 3.0 + 20.0;
         let free = ui.max_rect().right() - ui.cursor().left() - right_w;
         ui.add_space(free.max(10.0));
-        if outline_button(ui, theme, "Import CSV").clicked() {
+        let trashed = snap.trash.len();
+        let tip = if trashed == 0 {
+            "Trash \u{2014} empty".to_string()
+        } else {
+            format!("Trash \u{2014} {trashed} deleted type{}", if trashed == 1 { "" } else { "s" })
+        };
+        // Tinted when it holds something: the count moved into the tooltip, so the icon is
+        // the only thing left that can say the trash is not empty.
+        if icon_button(ui, theme, Icon::Trash, false, &tip, trashed > 0).clicked() {
+            state.modal = Modal::Trash(TrashModal::default());
+        }
+        ui.add_space(10.0);
+        if icon_button(ui, theme, Icon::Import, false, "Import task types from CSV", false).clicked() {
             state.modal = Modal::ImportReport(run_import(db));
             state.mark_dirty();
         }
         ui.add_space(10.0);
-        if solid_button(ui, theme, "New type").clicked() {
+        if icon_button(ui, theme, Icon::Plus, true, "New task type", false).clicked() {
             state.modal = Modal::Edit(new_type_form(snap.categories.first().map(|c| c.id).unwrap_or(0)));
         }
     });
@@ -583,6 +592,83 @@ fn link_colored(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Re
 fn link_width(ui: &egui::Ui, label: &str) -> f32 {
     ui.painter().layout_no_wrap(label.to_owned(), t::sans(t::CAPTION), egui::Color32::PLACEHOLDER).rect.width()
         + ui.spacing().button_padding.x * 2.0
+}
+
+/// The toolbar's icon glyphs. Painted as vectors rather than font glyphs: the bundled DM Sans
+/// carries no symbol coverage, and leaning on egui's emoji fallback for one specific codepoint
+/// is a guess that only fails on someone else's machine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    Trash,
+    Import,
+    Plus,
+}
+
+/// A square [`CTRL_H`] button carrying a painted [`Icon`] and a hover tooltip (the label the
+/// button no longer shows). `solid` picks the accent fill used by `New type`; `tinted` draws
+/// the glyph in the accent instead of `text_body`, which is how a non-empty trash announces
+/// itself now that its count lives in the tooltip.
+fn icon_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Icon,
+    solid: bool,
+    tip: &str,
+    tinted: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(CTRL_H, CTRL_H), egui::Sense::click());
+    let (fill, stroke, fg) = if solid {
+        (
+            if resp.hovered() { theme.accent_hover } else { theme.accent },
+            egui::Stroke::NONE,
+            theme.bg_raised,
+        )
+    } else {
+        (
+            theme.bg_raised,
+            egui::Stroke::new(1.0, if resp.hovered() { theme.accent_tint_border } else { theme.border_strong }),
+            if tinted { theme.accent } else { theme.text_body },
+        )
+    };
+    ui.painter().rect(rect, egui::CornerRadius::same(6), fill, stroke, egui::StrokeKind::Inside);
+    paint_icon(ui.painter(), icon, rect.center(), fg);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip)
+}
+
+/// Draws `icon` centred on `c` inside an 18px box — big enough to read at a glance, which is
+/// the whole point of dropping the labels.
+fn paint_icon(p: &egui::Painter, icon: Icon, c: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.6, color);
+    let line = |a: (f32, f32), b: (f32, f32)| {
+        p.line_segment([egui::pos2(c.x + a.0, c.y + a.1), egui::pos2(c.x + b.0, c.y + b.1)], s);
+    };
+    match icon {
+        Icon::Trash => {
+            line((-3.0, -7.0), (3.0, -7.0)); // handle
+            line((-7.5, -4.5), (7.5, -4.5)); // lid
+            // can: two sloping sides and a base, plus the two ribs that make it read as a bin
+            line((-5.5, -4.5), (-4.5, 8.0));
+            line((5.5, -4.5), (4.5, 8.0));
+            line((-4.5, 8.0), (4.5, 8.0));
+            line((-1.8, -1.0), (-1.8, 5.0));
+            line((1.8, -1.0), (1.8, 5.0));
+        }
+        Icon::Import => {
+            line((0.0, -8.0), (0.0, 1.5)); // shaft
+            line((-4.0, -2.5), (0.0, 1.5)); // arrowhead
+            line((4.0, -2.5), (0.0, 1.5));
+            line((-7.0, 3.0), (-7.0, 7.5)); // tray
+            line((-7.0, 7.5), (7.0, 7.5));
+            line((7.0, 3.0), (7.0, 7.5));
+        }
+        Icon::Plus => {
+            line((-6.5, 0.0), (6.5, 0.0));
+            line((0.0, -6.5), (0.0, 6.5));
+        }
+    }
 }
 
 /// Shared height for every toolbar control (search, filters, buttons).
