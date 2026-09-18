@@ -207,6 +207,16 @@ pub struct Theme {
     pub accent_muted_bar: egui::Color32,
     pub negative: egui::Color32,
 
+    // --- secondary accent -----------------------------------------------------------------
+    /// A blue sibling of `accent`: the same saturation and lightness, hue rotated to ~205°, so
+    /// it reads as part of the same family rather than an imported colour. Added because the
+    /// neutral outline used for a secondary button ("Start empty") disappeared into the
+    /// background in dark mode — it needs to be visibly a button without competing with the
+    /// accent-filled primary beside it.
+    pub secondary: egui::Color32,
+    pub secondary_tint_bg: egui::Color32,
+    pub secondary_tint_border: egui::Color32,
+
     // Selected pill
     pub pill_sel_bg: egui::Color32,
     pub pill_sel_border: egui::Color32,
@@ -264,6 +274,11 @@ impl Theme {
             accent_eyebrow: C::from_rgb(0x7A, 0x9E, 0x88),
             accent_muted_bar: C::from_rgb(0x8F, 0xC7, 0xA8),
             negative: C::from_rgb(0xB4, 0x48, 0x3F),
+
+            // `accent` #3F9C6A at hue 205° instead of 150°, saturation and lightness held.
+            secondary: C::from_rgb(0x40, 0x75, 0x9C),
+            secondary_tint_bg: C::from_rgb(0xEA, 0xF0, 0xF5),
+            secondary_tint_border: C::from_rgb(0xA9, 0xC3, 0xD6),
 
             pill_sel_bg: C::from_rgb(0xEA, 0xF3, 0xEE),
             pill_sel_border: C::from_rgb(0x9C, 0xC9, 0xB0),
@@ -337,6 +352,11 @@ impl Theme {
             accent_muted_bar: C::from_rgb(0x4E, 0x7D, 0x63),
             // Derived: same hue as light's negative, lightened for dark-surface contrast.
             negative: C::from_rgb(0xD1, 0x6E, 0x64),
+
+            // `accent-dark-theme` #4FB37D at hue 205°, saturation and lightness held.
+            secondary: C::from_rgb(0x51, 0x8A, 0xB3),
+            secondary_tint_bg: C::from_rgb(0x1B, 0x28, 0x33),
+            secondary_tint_border: C::from_rgb(0x2F, 0x4B, 0x63),
 
             pill_sel_bg: C::from_rgb(0x2A, 0x3A, 0x31),
             pill_sel_border: C::from_rgb(0x3B, 0x5A, 0x47),

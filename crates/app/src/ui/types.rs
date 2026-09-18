@@ -1798,7 +1798,7 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
             ImportOutcome::Report(r) => {
                 // Cards, not a list of "label: n" lines: the one number that answers "did it
                 // work" is `imported`, and a flat list buried it among four zeros.
-                stat_card_row(ui, theme, W, &[(r.imported as i64, "IMPORTED", true)], 56.0);
+                stat_card_row(ui, theme, W, &[(r.imported as i64, "IMPORTED", true)]);
                 ui.add_space(8.0);
                 stat_card_row(
                     ui,
@@ -1808,7 +1808,6 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
                         (r.categories_created as i64, "CATEGORIES CREATED", false),
                         (r.skipped_existing as i64, "ALREADY EXISTED", false),
                     ],
-                    48.0,
                 );
                 ui.add_space(8.0);
                 stat_card_row(
@@ -1819,7 +1818,6 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
                         (r.skipped_in_file as i64, "DUPLICATE IN FILE", false),
                         (r.skipped_malformed as i64, "MALFORMED, SKIPPED", false),
                     ],
-                    48.0,
                 );
                 if r.encoding == "windows-1252" {
                     ui.add_space(8.0);
@@ -2307,19 +2305,30 @@ fn trash_empty_state(ui: &mut egui::Ui, theme: &Theme) {
 ///
 /// A zero is drawn in `text_disabled` rather than hidden: "0 malformed" is reassurance, and a
 /// card that disappears would move the ones beside it between imports.
-fn stat_card_row(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    width: f32,
-    cards: &[(i64, &str, bool)],
-    height: f32,
-) {
+fn stat_card_row(ui: &mut egui::Ui, theme: &Theme, width: f32, cards: &[(i64, &str, bool)]) {
     const GAP: f32 = 8.0;
+    const PAD: f32 = 12.0;
+    /// Between the number's baseline block and the label under it.
+    const LEAD: f32 = 6.0;
+
+    let hero = cards.iter().any(|(_, _, h)| *h);
+    let value_font = t::mono_medium(if hero { 22.0 } else { 17.0 });
+    let label_font = t::mono(t::EYEBROW);
+
+    // Measure, never assume. The first version hard-coded the card height and positioned the
+    // label from the bottom edge, so at 48px the number and its label overlapped outright.
+    let probe = |font: egui::FontId| {
+        ui.painter().layout_no_wrap("0".to_owned(), font, egui::Color32::PLACEHOLDER).rect.height()
+    };
+    let value_h = probe(value_font.clone());
+    let label_h = probe(label_font.clone());
+    let height = PAD * 2.0 + value_h + LEAD + label_h;
+
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let n = cards.len().max(1) as f32;
     let card_w = (width - GAP * (n - 1.0)) / n;
 
-    for (i, (value, label, hero)) in cards.iter().enumerate() {
+    for (i, (value, label, is_hero)) in cards.iter().enumerate() {
         let card = egui::Rect::from_min_size(
             egui::pos2(rect.left() + i as f32 * (card_w + GAP), rect.top()),
             egui::vec2(card_w, height),
@@ -2334,23 +2343,23 @@ fn stat_card_row(
         );
         let value_color = if *value == 0 {
             theme.text_disabled
-        } else if *hero {
+        } else if *is_hero {
             theme.accent
         } else {
             theme.text_primary
         };
         p.text(
-            egui::pos2(card.left() + 14.0, card.top() + 10.0),
+            egui::pos2(card.left() + PAD, card.top() + PAD),
             egui::Align2::LEFT_TOP,
             value.to_string(),
-            t::mono_medium(if *hero { 22.0 } else { 17.0 }),
+            value_font.clone(),
             value_color,
         );
         p.text(
-            egui::pos2(card.left() + 14.0, card.bottom() - 10.0),
-            egui::Align2::LEFT_BOTTOM,
+            egui::pos2(card.left() + PAD, card.top() + PAD + value_h + LEAD),
+            egui::Align2::LEFT_TOP,
             *label,
-            t::mono(t::EYEBROW),
+            label_font.clone(),
             theme.text_tertiary,
         );
     }

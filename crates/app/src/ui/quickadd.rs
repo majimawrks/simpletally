@@ -313,7 +313,7 @@ pub fn show(
 
     let input_rect =
         egui::Rect::from_min_size(bg_rect.min, egui::vec2(WIDTH, INPUT_ROW_H));
-    paint_input_row(ui, &pt, input_rect, &state.query);
+    paint_input_row(ui, &pt, input_rect, &state.query, today);
     ui.painter().line_segment(
         [egui::pos2(input_rect.left(), input_rect.bottom()), egui::pos2(input_rect.right(), input_rect.bottom())],
         egui::Stroke::new(1.0, pt.divider),
@@ -414,7 +414,13 @@ fn commit(db: &Db, row: &Row, today_sql: &str, count: i64) -> Result<String, Str
     Ok(line)
 }
 
-fn paint_input_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, _query: &str) {
+fn paint_input_row(
+    ui: &mut egui::Ui,
+    pt: &t::PopupTheme,
+    rect: egui::Rect,
+    _query: &str,
+    today: NaiveDate,
+) {
     let badge_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 22.0, rect.center().y - 11.0),
         egui::vec2(22.0, 22.0),
@@ -430,14 +436,32 @@ fn paint_input_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, _que
     // would have given it.
     glyph::zheng(ui, badge_rect.shrink(3.0), pt.badge_glyph);
 
+    // The date, stacked over the Enter hint. Quick add always writes to the real today and
+    // never follows the Today screen's pinned date, so the two windows can legitimately be
+    // showing different days — without this, a tally that "went missing" from the visible
+    // screen invites the user to log it a second time.
     let painter = ui.painter();
+    let x = rect.right() - 22.0;
     painter.text(
-        egui::pos2(rect.right() - 22.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
+        egui::pos2(x, rect.center().y - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("logging to {}", long_date(today)),
+        t::mono(11.0),
+        pt.accent,
+    );
+    painter.text(
+        egui::pos2(x, rect.center().y + 3.0),
+        egui::Align2::RIGHT_TOP,
         "Enter to log",
         t::mono(11.0),
         pt.muted_text,
     );
+}
+
+/// `Fri 18 Sep` — unambiguous at a glance without spending the width a full date costs.
+/// Built by hand rather than with `%-d`, which isn't portable on Windows (see `today.rs`).
+fn long_date(d: NaiveDate) -> String {
+    format!("{} {} {}", d.format("%a"), d.day(), d.format("%b"))
 }
 
 fn paint_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, row: &Row, count: i64, selected: bool) {

@@ -8,5 +8,6 @@ pub mod migrate;
 pub mod quickadd;
 pub mod theme;
 pub mod today;
+pub mod tray_notice;
 pub mod types;
 pub mod widgets;

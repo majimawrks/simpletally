@@ -74,6 +74,12 @@ pub struct Settings {
     /// `None` until the window has been shown and moved/resized at least once.
     #[serde(default)]
     pub main_window_geometry: Option<WindowGeometry>,
+    /// Set once the user has ticked "don't show this again" on the notice explaining that
+    /// `[x]` hides to the tray rather than quitting. Defaults false, so a fresh install
+    /// explains itself once — the behaviour is otherwise indistinguishable from the app
+    /// having crashed.
+    #[serde(default)]
+    pub hide_to_tray_notice_dismissed: bool,
 }
 
 fn default_version() -> u32 {
@@ -103,6 +109,7 @@ impl Default for Settings {
             active_tab: default_active_tab(),
             note_field_open: false,
             main_window_geometry: None,
+            hide_to_tray_notice_dismissed: false,
         }
     }
 }
@@ -224,6 +231,7 @@ mod tests {
                 width: 1280,
                 height: 720,
             }),
+            hide_to_tray_notice_dismissed: true,
         };
 
         save(&settings, &tmp.path).expect("save should succeed");

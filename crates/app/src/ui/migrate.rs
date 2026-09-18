@@ -307,16 +307,17 @@ fn close_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
 /// file…"). Same silhouette as [`close_button`] — 32px tall, 6px radius — so the two read as a
 /// pair of real buttons, but neutral-filled with a border instead of accent.
 ///
-/// It used to be transparent text in `text_secondary`, which is how this codebase paints
-/// *disabled* text, so the app's only "no thanks" affordance looked unavailable. Deliberately
-/// not given a colour of its own: the palette is two hues (accent green, `negative` terracotta)
-/// and a third would be the only one in the app — and a coloured opt-out would compete with the
-/// recommended action instead of deferring to it.
+/// It was first transparent text in `text_secondary` (how this codebase paints *disabled*
+/// text), then a neutral outline — which in dark mode was a grey box on a near-black surface,
+/// still barely a button. It now uses `theme.secondary`, the blue sibling of the accent: same
+/// saturation and lightness, hue rotated, so it belongs to the palette rather than arriving
+/// from outside it. Tinted fill rather than solid, so it stays subordinate to the
+/// accent-filled primary beside it — the same treatment the trash view's `Restore` uses.
 fn secondary_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
     ui.add(
-        egui::Button::new(egui::RichText::new(label).font(t::sans_medium(t::BODY)).color(theme.text_body))
-            .fill(theme.bg_raised)
-            .stroke(egui::Stroke::new(1.0, theme.border_strong))
+        egui::Button::new(egui::RichText::new(label).font(t::sans_medium(t::BODY)).color(theme.secondary))
+            .fill(theme.secondary_tint_bg)
+            .stroke(egui::Stroke::new(1.0, theme.secondary_tint_border))
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 32.0)),
     )

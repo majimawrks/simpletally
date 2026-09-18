@@ -97,6 +97,11 @@ pub struct App {
     /// An import the user asked for, run at the *end* of the next frame so the migration
     /// modal's "Importing…" state reaches the screen before the main thread blocks on it.
     pending_import: Option<PathBuf>,
+    /// The one-time "closing hides to the tray" notice.
+    tray_notice: crate::ui::tray_notice::TrayNoticeState,
+    /// Mirrors `Settings::hide_to_tray_notice_dismissed`; the live value `current_settings`
+    /// writes back. Loaded at startup, set when the user ticks the checkbox.
+    hide_to_tray_notice_dismissed: bool,
 }
 
 /// Minimum time between settings writes. Dragging or resizing the main window would
@@ -253,6 +258,8 @@ impl App {
             theme_pref: loaded_settings.theme,
             pending_geometry: loaded_settings.main_window_geometry,
             pending_import: None,
+            tray_notice: crate::ui::tray_notice::TrayNoticeState::default(),
+            hide_to_tray_notice_dismissed: loaded_settings.hide_to_tray_notice_dismissed,
             last_saved_settings: loaded_settings,
             last_save_at: Instant::now(),
             settings_save_error_logged: false,
@@ -296,11 +303,13 @@ impl App {
         let types = &mut self.types;
         let tab = &mut self.tab;
         let migrate = &mut self.migrate;
+        let tray_notice = &mut self.tray_notice;
         let db = &self.db;
         let theme = &self.theme;
         let hotkey_error = self.hotkey_error.as_deref();
         let clear = crate::ui::theme::canvas_clear(theme);
         let mut migrate_action = crate::ui::migrate::Action::None;
+        let mut notice_action = crate::ui::tray_notice::Action::None;
         if let Some(win) = self.main.as_mut() {
             win.next_repaint = None;
             win.paint(clear, |ui| {
@@ -332,6 +341,7 @@ impl App {
                 if let (Ok(exe_dir), Ok(live_db)) = (db_service::exe_dir(), db_service::database_path()) {
                     migrate_action = crate::ui::migrate::show(ui, migrate, theme, &exe_dir, &live_db);
                 }
+                notice_action = crate::ui::tray_notice::show(ui, tray_notice, theme);
             });
             // The Task types screen can write data the other screens show (categories behind
             // Today's pill row, trash restore/purge moving entries) while they aren't the
@@ -356,6 +366,17 @@ impl App {
         // on the main thread (PHASE0 gate #3), so this call freezes the window for its whole
         // duration; without the earlier frame the user would just see the pre-click frame
         // sitting there, indistinguishable from a hang.
+        // The notice is the last thing standing between `[x]` and the window going away, so
+        // the hide happens here, once it's dismissed.
+        if let crate::ui::tray_notice::Action::Closed { remember } = notice_action {
+            // Held on `App`, not written into `last_saved_settings`: that field is what the
+            // change detector compares *against*, so setting it there would make the new value
+            // look already-saved and it would never reach the file. `current_settings` picks
+            // it up, `hide_main`'s flush writes it.
+            self.hide_to_tray_notice_dismissed |= remember;
+            self.hide_main();
+        }
+
         if let Some(chosen) = self.pending_import.take() {
             self.handle_migrate_import(chosen);
         }
@@ -602,6 +623,7 @@ impl App {
         s.active_tab = self.tab.as_str().to_string();
         s.note_field_open = self.today.note_open;
         s.main_window_geometry = self.current_geometry();
+        s.hide_to_tray_notice_dismissed = self.hide_to_tray_notice_dismissed;
         s
     }
 
@@ -755,7 +777,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CloseRequested => {
                 if is_main {
-                    self.hide_main();
+                    // First close (and every close until the user ticks "don't show again"):
+                    // explain that this hides rather than quits, and hide only once the notice
+                    // is dismissed. The notice is drawn in this window's own egui pass, so
+                    // hiding first would show it to nobody.
+                    if self.hide_to_tray_notice_dismissed {
+                        self.hide_main();
+                    } else {
+                        self.tray_notice.maybe_open(false);
+                        if let Some(w) = self.main.as_ref() {
+                            w.window().request_redraw();
+                        }
+                    }
                 } else if is_popup {
                     self.hide_popup(true);
                 }
