@@ -167,11 +167,12 @@ impl App {
                     migrate_action = crate::ui::migrate::show(ui, migrate, theme, &exe_dir, &live_db);
                 }
             });
-            // The manage-categories modal can write category changes that affect Today's
-            // pill row even while Today isn't the visible tab; drain the cross-screen flag
-            // every frame so it rebuilds next time it's shown.
-            if types.take_categories_changed() {
+            // The Task types screen can write data the other screens show (categories behind
+            // Today's pill row, trash restore/purge moving entries) while they aren't the
+            // visible tab; drain the cross-screen flag every frame so they rebuild next time.
+            if types.take_data_changed() {
                 today.mark_dirty();
+                insights.mark_dirty();
             }
             // NB: painting must NOT change visibility — a stray repaint would otherwise
             // re-show a window closed to the tray. Visibility is owned by show_/hide_.

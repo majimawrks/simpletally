@@ -7,8 +7,8 @@
 //! explicit-rect banding pattern (see the LAYOUT TRAP note in both of those files) rather than
 //! `allocate_ui_with_layout` inside a horizontal, which staircases children.
 //!
-//! **Out of scope (Phase 3C):** delete, merge-into, trash/restore/purge. Where the design shows
-//! a delete control, nothing is rendered.
+//! Phase 3C added the trash view: the delete dialog already wrote into the mirror tables, so
+//! this is a modal over finished plumbing (`core::trash`) — list, restore, purge.
 
 use crate::service::import::CombinedReport;
 use crate::ui::theme::{self as t, Theme};
@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 
 use simpletally_core::{
     aggregate::{TypeLifetimeTotal, TypeUsage},
+    trash::{DeletionSummary, RestoreReport},
     Category, Db, Error, TaskType,
 };
 
@@ -46,10 +47,11 @@ pub struct TypesState {
     dirty: bool,
     view: Option<View>,
     error: Option<String>,
-    /// Set when the category-management modal writes something that changes the Today
-    /// screen's category pill row (create/rename/reorder/remove). `app.rs` drains this
-    /// after each frame and marks `TodayState` dirty so the pills pick it up.
-    categories_changed: bool,
+    /// Set when this screen writes something the other screens show: a category change
+    /// (create/rename/reorder/remove) behind Today's pill row, or a trash restore/purge that
+    /// moves entries. `app.rs` drains this after each frame and marks Today and Insights
+    /// dirty so they re-query.
+    data_changed: bool,
 }
 
 enum Modal {
@@ -57,6 +59,16 @@ enum Modal {
     Edit(TypeForm),
     ImportReport(ImportOutcome),
     ManageCategories(CategoriesModal),
+    Trash(TrashModal),
+}
+
+/// Trash view (PLAN §4). The rows come from the frame's `Snap`, so this holds only the
+/// interaction state: which row's purge is awaiting its blocking confirmation, and the last
+/// refused write.
+#[derive(Default)]
+struct TrashModal {
+    confirm_purge: Option<i64>,
+    error: Option<String>,
 }
 
 enum ImportOutcome {
@@ -170,6 +182,7 @@ struct View {
     /// All types, active and inactive — filters are applied at render time.
     types: Vec<TaskType>,
     lifetime: std::collections::BTreeMap<i64, i64>,
+    trash: Vec<DeletionSummary>,
 }
 
 impl TypesState {
@@ -186,7 +199,7 @@ impl TypesState {
             dirty: true,
             view: None,
             error: None,
-            categories_changed: false,
+            data_changed: false,
         }
     }
 
@@ -208,10 +221,10 @@ impl TypesState {
         self.mark_dirty();
     }
 
-    /// Consumes the cross-screen "category data changed" flag (see field doc). Called by
-    /// `app.rs` once per frame after this screen's `show`.
-    pub fn take_categories_changed(&mut self) -> bool {
-        std::mem::take(&mut self.categories_changed)
+    /// Consumes the cross-screen "data changed" flag (see field doc). Called by `app.rs`
+    /// once per frame after this screen's `show`.
+    pub fn take_data_changed(&mut self) -> bool {
+        std::mem::take(&mut self.data_changed)
     }
 
     fn ensure_view(&mut self, db: &Db) {
@@ -236,7 +249,8 @@ impl TypesState {
             .into_iter()
             .map(|t| (t.task_type_id, t.total))
             .collect();
-        Ok(View { categories, types, lifetime })
+        let trash = db.list_trash()?;
+        Ok(View { categories, types, lifetime, trash })
     }
 }
 
@@ -392,6 +406,7 @@ struct Snap {
     categories: Vec<Category>,
     types: Vec<TaskType>,
     lifetime: std::collections::BTreeMap<i64, i64>,
+    trash: Vec<DeletionSummary>,
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme) {
@@ -408,6 +423,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme) {
         categories: view.categories.clone(),
         types: view.types.clone(),
         lifetime: view.lifetime.clone(),
+        trash: view.trash.clone(),
     };
 
     // Explicit-rect banding: toolbar top, caption band pinned bottom, table in between. See
@@ -460,6 +476,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme) {
     delete_modal(ui, state, db, theme);
     import_report_modal(ui, state, theme);
     manage_categories_modal(ui, state, db, theme);
+    trash_modal(ui, state, db, theme, &snap);
 }
 
 /// Toolbar: search, category filter, active filter, "Manage categories" link, then
@@ -525,6 +542,11 @@ fn toolbar(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
             }));
         }
 
+        ui.add_space(10.0);
+        if outline_button(ui, theme, &format!("Trash ({})", snap.trash.len())).clicked() {
+            state.modal = Modal::Trash(TrashModal::default());
+        }
+
         // Right-aligned by measuring and padding, not `Layout::right_to_left`: nested inside
         // this horizontal, that layout claims a rect the left-hand controls already used and
         // the two buttons land on top of "Manage categories".
@@ -544,14 +566,23 @@ fn toolbar(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
 
 /// A frameless text link in the accent color.
 fn link(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response {
-    let resp = ui.add(
-        egui::Button::new(egui::RichText::new(text).font(t::sans(t::CAPTION)).color(theme.accent))
-            .frame(false),
-    );
+    link_colored(ui, theme.accent, text)
+}
+
+/// [`link`] in an arbitrary color (the trash view's `Purge` is `negative`).
+fn link_colored(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Response {
+    let resp = ui
+        .add(egui::Button::new(egui::RichText::new(text).font(t::sans(t::CAPTION)).color(color)).frame(false));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+/// The width [`link`] will take for `label` — the row-layout counterpart of [`button_width`].
+fn link_width(ui: &egui::Ui, label: &str) -> f32 {
+    ui.painter().layout_no_wrap(label.to_owned(), t::sans(t::CAPTION), egui::Color32::PLACEHOLDER).rect.width()
+        + ui.spacing().button_padding.x * 2.0
 }
 
 /// Shared height for every toolbar control (search, filters, buttons).
@@ -1726,6 +1757,205 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
     }
 }
 
+// --- trash view (PLAN §4) -------------------------------------------------------------
+
+/// The detail line under a trash row.
+pub fn trash_row_detail(d: &DeletionSummary) -> String {
+    format!(
+        "{} type{} \u{b7} {} tallies \u{b7} deleted {}",
+        d.type_count,
+        if d.type_count == 1 { "" } else { "s" },
+        d.entry_count,
+        short_stamp(&d.deleted_at),
+    )
+}
+
+/// `deleted_at` is `YYYY-MM-DD HH:MM:SS.sss`; the seconds are noise in a list.
+fn short_stamp(ts: &str) -> &str {
+    ts.get(..16).unwrap_or(ts)
+}
+
+/// What a restore put back, naming any rename it had to make: `core::trash` renames rather
+/// than attaching restored history to a live namesake, and the user has to be told which.
+pub fn restore_notice(r: &RestoreReport) -> String {
+    let mut s = format!("Restored {} types and {} tallies.", r.restored_types, r.restored_entries);
+    for (old, new) in &r.renamed {
+        s.push_str(&format!(" \u{201c}{old}\u{201d} already existed \u{2014} restored as \u{201c}{new}\u{201d}."));
+    }
+    s
+}
+
+/// The trash view: one row per deletion unit, Restore or Purge. Nothing here is destructive
+/// except Purge, which goes through its own blocking confirmation stating the entry count.
+fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme, snap: &Snap) {
+    let Modal::Trash(tm) = &state.modal else { return };
+    let confirm_purge = tm.confirm_purge;
+    let error = tm.error.clone();
+
+    let mut close = false;
+    let mut restore: Option<i64> = None;
+    let mut ask_purge: Option<i64> = None;
+
+    egui::Modal::new(egui::Id::new("type_trash")).show(ui.ctx(), |ui| {
+        ui.set_width(470.0);
+        ui.label(egui::RichText::new("Trash").font(t::sans_medium(t::SECTION_TITLE)).color(theme.text_primary));
+        ui.label(
+            egui::RichText::new("Deleted types keep their tallies here until they are purged.")
+                .font(t::sans(t::CAPTION))
+                .color(theme.text_quiet),
+        );
+        ui.separator();
+
+        if snap.trash.is_empty() {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Nothing in the trash.").font(t::sans(t::BODY)).color(theme.text_quiet));
+            ui.add_space(10.0);
+        } else {
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for d in &snap.trash {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&d.summary)
+                                    .font(t::sans_medium(t::BODY))
+                                    .color(theme.text_primary),
+                            );
+                            ui.label(
+                                egui::RichText::new(trash_row_detail(d))
+                                    .font(t::sans(t::CAPTION))
+                                    .color(theme.text_quiet),
+                            );
+                        });
+                        // Measured right-alignment, not `Layout::right_to_left` — nested in a
+                        // horizontal, that layout claims a rect the left column already used.
+                        let right_w = link_width(ui, "Restore") + 10.0 + link_width(ui, "Purge");
+                        let free = ui.max_rect().right() - ui.cursor().left() - right_w;
+                        ui.add_space(free.max(8.0));
+                        if link(ui, theme, "Restore").clicked() {
+                            restore = Some(d.deletion_id);
+                        }
+                        ui.add_space(10.0);
+                        if link_colored(ui, theme.negative, "Purge").clicked() {
+                            ask_purge = Some(d.deletion_id);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+                }
+            });
+        }
+
+        if let Some(err) = &error {
+            ui.add_space(8.0);
+            ui.colored_label(theme.negative, err);
+        }
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if outline_button(ui, theme, "Close").clicked() {
+                close = true;
+            }
+        });
+    });
+
+    // The blocking purge confirmation, drawn over the list (PLAN §4: purge keeps the loud
+    // confirmation and states the entry count it destroys).
+    let mut do_purge: Option<i64> = None;
+    if let Some(id) = confirm_purge {
+        match snap.trash.iter().find(|d| d.deletion_id == id) {
+            // The row vanished under us (another write rebuilt the view) — drop the prompt.
+            None => {
+                if let Modal::Trash(tm) = &mut state.modal {
+                    tm.confirm_purge = None;
+                }
+            }
+            Some(d) => {
+                let mut cancel = false;
+                egui::Modal::new(egui::Id::new("type_trash_purge")).show(ui.ctx(), |ui| {
+                    ui.set_width(380.0);
+                    ui.label(
+                        egui::RichText::new(format!("Purge {}?", d.summary))
+                            .font(t::sans_medium(t::SECTION_TITLE))
+                            .color(theme.text_primary),
+                    );
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "This permanently destroys {} tallies. It cannot be undone.",
+                            d.entry_count
+                        ))
+                        .font(t::sans(t::BODY))
+                        .color(theme.text_body),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if outline_button(ui, theme, "Cancel").clicked() {
+                            cancel = true;
+                        }
+                        ui.add_space(8.0);
+                        if primary_button(ui, theme, "Purge permanently", true, theme.negative) {
+                            do_purge = Some(id);
+                        }
+                    });
+                });
+                if cancel {
+                    if let Modal::Trash(tm) = &mut state.modal {
+                        tm.confirm_purge = None;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(id) = ask_purge {
+        if let Modal::Trash(tm) = &mut state.modal {
+            tm.confirm_purge = Some(id);
+        }
+    }
+    if let Some(id) = restore {
+        match db.restore_from_trash(id) {
+            // A restore can recreate a category and re-wires entries, so Today and Insights
+            // are both stale.
+            Ok(report) => {
+                state.notice = Some(restore_notice(&report));
+                state.data_changed = true;
+                state.mark_dirty();
+                if let Modal::Trash(tm) = &mut state.modal {
+                    tm.error = None;
+                }
+            }
+            Err(e) => {
+                if let Modal::Trash(tm) = &mut state.modal {
+                    tm.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    if let Some(id) = do_purge {
+        match db.purge(id) {
+            Ok(n) => {
+                state.notice = Some(format!("Purged {n} tallies."));
+                state.data_changed = true;
+                state.mark_dirty();
+                if let Modal::Trash(tm) = &mut state.modal {
+                    tm.confirm_purge = None;
+                    tm.error = None;
+                }
+            }
+            Err(e) => {
+                if let Modal::Trash(tm) = &mut state.modal {
+                    tm.confirm_purge = None;
+                    tm.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    if close {
+        state.modal = Modal::None;
+    }
+}
+
 // --- category management (screen 08) ------------------------------------------------------
 
 /// Shared row height (drag handle / name+subline / pencil+Remove all sized to this).
@@ -1993,7 +2223,7 @@ fn manage_categories_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, t
     }
 
     if today_dirty {
-        state.categories_changed = true;
+        state.data_changed = true;
     }
     if close {
         state.modal = Modal::None;
@@ -2408,6 +2638,42 @@ fn pencil_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deletion(types: i64, entries: i64) -> DeletionSummary {
+        DeletionSummary {
+            deletion_id: 1,
+            deleted_at: "2026-09-18 14:03:27.412".into(),
+            kind: "task_type".into(),
+            summary: "PENGAWASAN - Rekonsiliasi (12 entries)".into(),
+            type_count: types,
+            entry_count: entries,
+        }
+    }
+
+    #[test]
+    fn trash_detail_pluralises_and_trims_the_stamp() {
+        assert_eq!(trash_row_detail(&deletion(1, 12)), "1 type \u{b7} 12 tallies \u{b7} deleted 2026-09-18 14:03");
+        assert_eq!(trash_row_detail(&deletion(2, 0)), "2 types \u{b7} 0 tallies \u{b7} deleted 2026-09-18 14:03");
+        // A short/odd stamp must not panic or slice mid-character.
+        let mut d = deletion(1, 1);
+        d.deleted_at = "2026".into();
+        assert!(trash_row_detail(&d).ends_with("2026"));
+    }
+
+    #[test]
+    fn restore_notice_names_every_rename() {
+        let plain = RestoreReport { restored_types: 1, restored_entries: 12, renamed: vec![] };
+        assert_eq!(restore_notice(&plain), "Restored 1 types and 12 tallies.");
+
+        let renamed = RestoreReport {
+            restored_types: 1,
+            restored_entries: 12,
+            renamed: vec![("Rekonsiliasi".into(), "Rekonsiliasi (restored)".into())],
+        };
+        let msg = restore_notice(&renamed);
+        assert!(msg.contains("Rekonsiliasi (restored)"), "{msg}");
+        assert!(msg.contains("already existed"), "{msg}");
+    }
 
     fn ty(id: i64, category_id: i64, name: &str, description: &str, is_active: bool) -> TaskType {
         TaskType {
