@@ -226,6 +226,20 @@ impl TypesState {
         self.mark_dirty();
     }
 
+    /// A write landed: rebuild this screen **and** tell the other screens, which cache their
+    /// own views. Every mutation here changes what Today's tile grid and Insights' totals
+    /// show — a new or renamed type, a deactivated one, an import, a delete.
+    ///
+    /// Use this, not [`Self::mark_dirty`], for anything that touches the database.
+    /// `mark_dirty` alone is for changes only this screen can see, like the search box or the
+    /// category filter. Getting that wrong is invisible until you switch tabs: an import left
+    /// Today showing an empty grid until the category pill was clicked, because clicking it
+    /// happened to dirty Today for an unrelated reason.
+    fn mark_written(&mut self) {
+        self.dirty = true;
+        self.data_changed = true;
+    }
+
     /// Consumes the cross-screen "data changed" flag (see field doc). Called by `app.rs`
     /// once per frame after this screen's `show`.
     pub fn take_data_changed(&mut self) -> bool {
@@ -574,7 +588,7 @@ fn toolbar(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
         ui.add_space(10.0);
         if icon_button(ui, theme, Icon::Import, false, "Import task types from CSV", false).clicked() {
             state.modal = Modal::ImportReport(run_import(db));
-            state.mark_dirty();
+            state.mark_written();
         }
         ui.add_space(10.0);
         if icon_button(ui, theme, Icon::Plus, true, "New task type", false).clicked() {
@@ -896,7 +910,7 @@ fn table(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap, 
                 state.notice = Some(e.to_string());
             } else {
                 state.notice = None;
-                state.mark_dirty();
+                state.mark_written();
             }
         }
     }
@@ -977,7 +991,7 @@ fn caption(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
                 }
             }
             state.notice = first_err;
-            state.mark_dirty();
+            state.mark_written();
         }
     });
 }
@@ -1274,7 +1288,7 @@ fn edit_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme,
     match result {
         Ok(()) => {
             state.modal = Modal::None;
-            state.mark_dirty();
+            state.mark_written();
         }
         Err(Error::Duplicate(_)) => {
             form.error = Some("a type with that name already exists in this category".to_string());
@@ -1458,7 +1472,7 @@ fn delete_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Them
     match result {
         Ok(()) => {
             state.modal = Modal::None;
-            state.mark_dirty();
+            state.mark_written();
         }
         Err(e) => df.error = Some(e.to_string()),
     }
