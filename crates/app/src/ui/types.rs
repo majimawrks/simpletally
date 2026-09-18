@@ -1848,13 +1848,9 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
 /// Row card height, and the gap between cards.
 const TRASH_ROW_H: f32 = 84.0;
 const TRASH_ROW_GAP: f32 = 8.0;
-/// The draining retention bar, and the `Restore` button beside it.
-const TRASH_BAR_W: f32 = 78.0;
+/// The `Restore` button.
 const TRASH_BTN_W: f32 = 92.0;
 const TRASH_BTN_H: f32 = 34.0;
-/// Under this many days left, the countdown turns red — "an item about to vanish is visible
-/// without reading the dates" (design BEHAVIOR note).
-const TRASH_URGENT_DAYS: i64 = 3;
 
 /// The modal's mono subtitle: what the trash is holding in total.
 pub fn trash_header(types: i64, tallies: i64) -> String {
@@ -1901,14 +1897,30 @@ pub fn months_phrase(months: &[String]) -> String {
     }
 }
 
-/// The countdown chip's text. Zero reads `Expired`, not `0d` — nothing is auto-purged here
-/// (deliberate deviation from the design's "auto-purge on app start"; see `notes/STATUS.md`),
-/// so the row needs to say it is merely due rather than gone.
-pub fn countdown_label(days: i64) -> String {
-    if days <= 0 {
-        "Expired".to_string()
-    } else {
-        format!("{days}d")
+/// How long ago the unit was deleted, in words: `today`, `yesterday`, `5 days ago`,
+/// `3 weeks ago`, `2 months ago`, `1 year ago`.
+///
+/// This replaced the design's `28d` countdown over a draining bar. Without the mock's
+/// auto-purge (see `notes/STATUS.md`) the bar measured a deadline that never arrives, and at
+/// 30 days' scale a 2-days-left bar and an expired one both painted as the same few red
+/// pixels — the two states it most needed to tell apart. Age in words needs no legend.
+pub fn relative_age(deleted_at: &str, today: chrono::NaiveDate) -> String {
+    let Some(d) = deleted_at
+        .get(..10)
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    else {
+        return String::new();
+    };
+    let days = (today - d).num_days();
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match days {
+        // A clock skew or a hand-edited row must not read "-3 days ago".
+        i64::MIN..=0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        2..=6 => plural(days, "day"),
+        7..=29 => plural(days / 7, "week"),
+        30..=364 => plural(days / 30, "month"),
+        _ => plural(days / 365, "year"),
     }
 }
 
@@ -1968,8 +1980,7 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "The countdown marks when a type is old enough to clear out. Nothing is \
-                     removed on its own.",
+                    "Nothing is removed on its own.",
                 )
                 .font(t::sans(t::CAPTION))
                 .color(theme.text_quiet),
@@ -2108,17 +2119,13 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
     }
 }
 
-/// One trash row: category eyebrow over the name over `N tallies · deleted 16 Sep`, with the
-/// retention countdown + draining bar and a `Restore` button on the right. Painted into one
-/// allocated rect rather than nested layouts — see the LAYOUT TRAP note at the top of the file.
+/// One trash row: category eyebrow over the name over `N tallies · deleted 16 Sep`, with how
+/// long ago it was deleted and a `Restore` button on the right. Painted into one allocated
+/// rect rather than nested layouts — see the LAYOUT TRAP note at the top of the file.
 /// Returns whether `Restore` was clicked.
 fn trash_row(ui: &mut egui::Ui, theme: &Theme, d: &DeletionSummary, today: chrono::NaiveDate) -> bool {
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, TRASH_ROW_H), egui::Sense::hover());
-
-    let days = simpletally_core::trash::days_left(&d.deleted_at, today);
-    let urgent = days <= TRASH_URGENT_DAYS;
-    let count_color = if urgent { theme.negative } else { theme.accent };
 
     {
         let p = ui.painter();
@@ -2153,35 +2160,14 @@ fn trash_row(ui: &mut egui::Ui, theme: &Theme, d: &DeletionSummary, today: chron
             theme.text_quiet,
         );
 
-        // Countdown above its bar, both right-aligned to the button's left edge.
-        let bar_right = rect.right() - 14.0 - TRASH_BTN_W - 14.0;
+        // Age in words, right-aligned to the button's left edge.
         p.text(
-            egui::pos2(bar_right, rect.center().y - 6.0),
-            egui::Align2::RIGHT_BOTTOM,
-            countdown_label(days),
-            t::mono(t::BODY),
-            count_color,
+            egui::pos2(rect.right() - 14.0 - TRASH_BTN_W - 16.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            relative_age(&d.deleted_at, today),
+            t::mono(t::CAPTION),
+            theme.text_secondary,
         );
-        let bar_y = rect.center().y + 6.0;
-        let bar_left = bar_right - TRASH_BAR_W;
-        p.line_segment(
-            [egui::pos2(bar_left, bar_y), egui::pos2(bar_right, bar_y)],
-            egui::Stroke::new(2.0, theme.bg_track),
-        );
-        let frac =
-            (days as f32 / simpletally_core::trash::RETENTION_DAYS as f32).clamp(0.0, 1.0);
-        if frac > 0.0 {
-            p.line_segment(
-                [egui::pos2(bar_left, bar_y), egui::pos2(bar_left + TRASH_BAR_W * frac, bar_y)],
-                egui::Stroke::new(2.0, count_color),
-            );
-        } else {
-            // Expired: a stub of colour, so the row still reads as a bar rather than a gap.
-            p.line_segment(
-                [egui::pos2(bar_left, bar_y), egui::pos2(bar_left + 4.0, bar_y)],
-                egui::Stroke::new(2.0, count_color),
-            );
-        }
     }
 
     let btn_rect = egui::Rect::from_min_size(
@@ -2991,11 +2977,24 @@ mod tests {
     }
 
     #[test]
-    fn countdown_says_expired_rather_than_zero_days() {
-        assert_eq!(countdown_label(28), "28d");
-        assert_eq!(countdown_label(1), "1d");
-        assert_eq!(countdown_label(0), "Expired");
-        assert_eq!(countdown_label(-5), "Expired");
+    fn relative_age_reads_as_words_at_every_scale() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+        let ago = |days: i64| {
+            let d = today - chrono::Duration::days(days);
+            relative_age(&format!("{d} 09:14:02.000"), today)
+        };
+        assert_eq!(ago(0), "today");
+        assert_eq!(ago(1), "yesterday");
+        assert_eq!(ago(5), "5 days ago");
+        assert_eq!(ago(7), "1 week ago");
+        assert_eq!(ago(21), "3 weeks ago");
+        assert_eq!(ago(30), "1 month ago");
+        assert_eq!(ago(90), "3 months ago");
+        assert_eq!(ago(400), "1 year ago");
+        assert_eq!(ago(800), "2 years ago");
+        // A stamp in the future (clock skew, hand-edited row) must not read "-3 days ago".
+        assert_eq!(ago(-3), "today");
+        assert_eq!(relative_age("nonsense", today), "");
     }
 
     #[test]
