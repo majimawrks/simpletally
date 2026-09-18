@@ -300,9 +300,16 @@ pub fn show(
     // A transparent `TextEdit` overlaid on the painted input row: it owns focus/cursor/IME
     // but the row's chrome (badge, hint) is painted separately so the row can be laid out
     // without fighting egui's built-in widget frame.
+    //
+    // The rect is only as tall as one line, centred in the row. Given the row's full height
+    // the child `Ui` lays the field out at the TOP of it (`Layout::top_down`), which put the
+    // text and caret hard against the row's upper edge — `vertical_align` only centres the
+    // text inside the widget, and the widget was one line tall either way.
+    let edit_h = t::QUICK_ADD * 1.4;
+    let edit_x = input_rect.left() + 22.0 + 22.0 + 12.0;
     let edit_rect = egui::Rect::from_min_size(
-        egui::pos2(input_rect.left() + 22.0 + 22.0 + 12.0, input_rect.top()),
-        egui::vec2((input_rect.width() - 22.0 - 22.0 - 12.0 - 22.0 - 120.0).max(0.0), input_rect.height()),
+        egui::pos2(edit_x, input_rect.center().y - edit_h / 2.0),
+        egui::vec2((input_rect.right() - 22.0 - 120.0 - edit_x).max(0.0), edit_h),
     );
     let mut child = ui.new_child(
         egui::UiBuilder::new().max_rect(edit_rect).layout(egui::Layout::top_down(egui::Align::Min)),
@@ -361,14 +368,22 @@ pub fn show(
 }
 
 fn paint_input_row(ui: &mut egui::Ui, pt: &t::PopupTheme, rect: egui::Rect, _query: &str) {
-    let painter = ui.painter();
     let badge_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 22.0, rect.center().y - 11.0),
         egui::vec2(22.0, 22.0),
     );
-    painter.rect(badge_rect, egui::CornerRadius::same(6), pt.accent, egui::Stroke::NONE, egui::StrokeKind::Inside);
-    glyph::zheng(painter, badge_rect, pt.badge_glyph, 1.6);
+    ui.painter().rect(
+        badge_rect,
+        egui::CornerRadius::same(6),
+        pt.accent,
+        egui::Stroke::NONE,
+        egui::StrokeKind::Inside,
+    );
+    // Inset: the icon's mark fills its disc edge to edge, and needs the padding the disc
+    // would have given it.
+    glyph::zheng(ui, badge_rect.shrink(3.0), pt.badge_glyph);
 
+    let painter = ui.painter();
     painter.text(
         egui::pos2(rect.right() - 22.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
