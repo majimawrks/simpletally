@@ -16,15 +16,43 @@
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-/// One row in the trash view.
+/// How long a trashed unit is held before it counts as stale. Nothing is destroyed when the
+/// countdown runs out — the trash view just marks the row expired and the user decides. See
+/// the deliberate deviation from the design's "auto-purge on app start" in `notes/STATUS.md`.
+pub const RETENTION_DAYS: i64 = 30;
+
+/// One row in the trash view (design `_rustrefactor/screens/10-trash.png`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionSummary {
     pub deletion_id: i64,
     pub deleted_at: String,
     pub kind: String,
     pub summary: String,
+    /// The first trashed type's category, from the snapshot taken at delete time — the live
+    /// category may be gone. Empty if the unit somehow holds no type.
+    pub category_name: String,
+    /// The first trashed type's name.
+    pub type_name: String,
     pub type_count: i64,
+    /// Mirror *rows* held. Not what the UI shows — see `tally_count`.
     pub entry_count: i64,
+    /// Tallies held: `SUM(count)`, matching what "Used" means everywhere else in the app.
+    /// An entry row can carry a count above 1, so these two numbers differ.
+    pub tally_count: i64,
+}
+
+/// Whole days left before `deleted_at` passes [`RETENTION_DAYS`], clamped at 0 (expired).
+/// `deleted_at` is the stored `YYYY-MM-DD HH:MM:SS.sss`; only the date part is read, so the
+/// countdown ticks on day boundaries rather than at an invisible time of day.
+pub fn days_left(deleted_at: &str, today: chrono::NaiveDate) -> i64 {
+    let Some(d) = deleted_at
+        .get(..10)
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    else {
+        // An unparseable stamp must not hide the row or claim it is fresh; treat it as due.
+        return 0;
+    };
+    (RETENTION_DAYS - (today - d).num_days()).max(0)
 }
 
 /// What a restore did (PLAN §4 — restore reports what it put back and any rename).
@@ -242,12 +270,42 @@ pub(crate) fn purge(conn: &Connection, deletion_id: i64) -> Result<i64> {
     Ok(entry_count)
 }
 
+/// Permanently destroy **everything** in the trash in one transaction (the design's
+/// `Purge all now`). Returns `(units, tallies)` destroyed, for the confirmation that has
+/// already been shown. Per-unit purge stays available for a single row.
+pub(crate) fn purge_all(conn: &Connection) -> Result<(i64, i64)> {
+    let tx = conn.unchecked_transaction()?;
+    let units: i64 = tx.query_row("SELECT COUNT(*) FROM deletions", [], |r| r.get(0))?;
+    let tallies: i64 =
+        tx.query_row("SELECT COALESCE(SUM(count), 0) FROM deleted_entries", [], |r| r.get(0))?;
+    // `deletions` cascades both mirror tables.
+    tx.execute("DELETE FROM deletions", [])?;
+    tx.commit()?;
+    Ok((units, tallies))
+}
+
+/// The distinct `YYYY-MM` months the trash holds tallies in, ascending. The purge
+/// confirmation names them: a purge silently changes those months' totals, which is the
+/// actual cost of the action (PLAN §0 — the totals are the product).
+pub(crate) fn trash_months(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT substr(date, 1, 7) FROM deleted_entries ORDER BY 1",
+    )?;
+    let out = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok(out)
+}
+
 /// The trash view: every deletion unit, newest first, with its type/entry counts (PLAN §4).
 pub(crate) fn list_trash(conn: &Connection) -> Result<Vec<DeletionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT d.id, d.deleted_at, d.kind, d.summary, \
                 (SELECT COUNT(*) FROM deleted_types dt WHERE dt.deletion_id = d.id), \
-                (SELECT COUNT(*) FROM deleted_entries de WHERE de.deletion_id = d.id) \
+                (SELECT COUNT(*) FROM deleted_entries de WHERE de.deletion_id = d.id), \
+                (SELECT COALESCE(SUM(de.count), 0) FROM deleted_entries de WHERE de.deletion_id = d.id), \
+                (SELECT dt.category_name FROM deleted_types dt WHERE dt.deletion_id = d.id \
+                   ORDER BY dt.id LIMIT 1), \
+                (SELECT dt.name FROM deleted_types dt WHERE dt.deletion_id = d.id \
+                   ORDER BY dt.id LIMIT 1) \
          FROM deletions d ORDER BY d.deleted_at DESC, d.id DESC",
     )?;
     let out = stmt
@@ -259,6 +317,10 @@ pub(crate) fn list_trash(conn: &Connection) -> Result<Vec<DeletionSummary>> {
                 summary: r.get(3)?,
                 type_count: r.get(4)?,
                 entry_count: r.get(5)?,
+                tally_count: r.get(6)?,
+                // A unit with no type rows leaves these NULL rather than failing the list.
+                category_name: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                type_name: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -399,6 +461,71 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn days_left_counts_down_and_clamps_at_zero() {
+        let deleted = "2026-09-01 14:03:27.412";
+        assert_eq!(days_left(deleted, day("2026-09-01")), 30);
+        assert_eq!(days_left(deleted, day("2026-09-03")), 28);
+        assert_eq!(days_left(deleted, day("2026-10-01")), 0);
+        // Past the window it stays 0, never negative.
+        assert_eq!(days_left(deleted, day("2027-01-01")), 0);
+    }
+
+    #[test]
+    fn days_left_treats_an_unreadable_stamp_as_due() {
+        assert_eq!(days_left("", day("2026-09-01")), 0);
+        assert_eq!(days_left("not a date at all", day("2026-09-01")), 0);
+    }
+
+    #[test]
+    fn list_reports_tallies_not_rows_and_keeps_the_category_snapshot() {
+        let conn = db();
+        let cat = add_category(&conn, "SAKTI");
+        let ty = add_type(&conn, cat, "Pendaftaran Email");
+        // Two rows, five tallies: the trash view must show 5, not 2.
+        add_entry(&conn, ty, "2026-08-14", 2, "", "2026-08-14 09:00:00.000");
+        add_entry(&conn, ty, "2026-09-02", 3, "", "2026-09-02 09:00:00.000");
+        let id = trash_task_type(&conn, ty).unwrap();
+        // The category goes away while the type sits in the trash; the snapshot survives.
+        conn.execute("DELETE FROM categories WHERE id = ?1", [cat]).unwrap();
+
+        let list = list_trash(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].deletion_id, id);
+        assert_eq!(list[0].entry_count, 2, "mirror rows");
+        assert_eq!(list[0].tally_count, 5, "tallies held");
+        assert_eq!(list[0].category_name, "SAKTI");
+        assert_eq!(list[0].type_name, "Pendaftaran Email");
+
+        assert_eq!(trash_months(&conn).unwrap(), vec!["2026-08", "2026-09"]);
+    }
+
+    #[test]
+    fn purge_all_empties_every_mirror_table_and_reports_tallies() {
+        let conn = db();
+        let cat = add_category(&conn, "SAKTI");
+        let a = add_type(&conn, cat, "A");
+        let b = add_type(&conn, cat, "B");
+        add_entry(&conn, a, "2026-09-01", 4, "", "2026-09-01 09:00:00.000");
+        add_entry(&conn, b, "2026-09-02", 3, "", "2026-09-02 09:00:00.000");
+        trash_task_type(&conn, a).unwrap();
+        trash_task_type(&conn, b).unwrap();
+
+        assert_eq!(purge_all(&conn).unwrap(), (2, 7));
+        assert!(list_trash(&conn).unwrap().is_empty());
+        for t in ["deletions", "deleted_types", "deleted_entries"] {
+            let n: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{t} still holds rows");
+        }
+        // Empty trash: a no-op that reports nothing rather than failing.
+        assert_eq!(purge_all(&conn).unwrap(), (0, 0));
     }
 
     #[test]

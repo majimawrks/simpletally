@@ -220,6 +220,16 @@ impl Db {
     pub fn list_trash(&self) -> Result<Vec<DeletionSummary>> {
         trash::list_trash(&self.conn)
     }
+
+    /// Purge the whole trash in one transaction; returns `(units, tallies)` destroyed.
+    pub fn purge_all(&self) -> Result<(i64, i64)> {
+        trash::purge_all(&self.conn)
+    }
+
+    /// The `YYYY-MM` months the trash holds tallies in — the months a purge would change.
+    pub fn trash_months(&self) -> Result<Vec<String>> {
+        trash::trash_months(&self.conn)
+    }
 }
 
 fn premigration_path(path: &Path) -> PathBuf {

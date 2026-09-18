@@ -63,11 +63,11 @@ enum Modal {
 }
 
 /// Trash view (PLAN §4). The rows come from the frame's `Snap`, so this holds only the
-/// interaction state: which row's purge is awaiting its blocking confirmation, and the last
-/// refused write.
+/// interaction state: whether the purge-everything confirmation is up, and the last refused
+/// write.
 #[derive(Default)]
 struct TrashModal {
-    confirm_purge: Option<i64>,
+    confirm_purge_all: bool,
     error: Option<String>,
 }
 
@@ -1843,22 +1843,73 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
     }
 }
 
-// --- trash view (PLAN §4) -------------------------------------------------------------
+// --- trash view (PLAN §4, design `_rustrefactor/screens/10-trash.png`) ---------------------
 
-/// The detail line under a trash row.
-pub fn trash_row_detail(d: &DeletionSummary) -> String {
+/// Row card height, and the gap between cards.
+const TRASH_ROW_H: f32 = 84.0;
+const TRASH_ROW_GAP: f32 = 8.0;
+/// The draining retention bar, and the `Restore` button beside it.
+const TRASH_BAR_W: f32 = 78.0;
+const TRASH_BTN_W: f32 = 92.0;
+const TRASH_BTN_H: f32 = 34.0;
+/// Under this many days left, the countdown turns red — "an item about to vanish is visible
+/// without reading the dates" (design BEHAVIOR note).
+const TRASH_URGENT_DAYS: i64 = 3;
+
+/// The modal's mono subtitle: what the trash is holding in total.
+pub fn trash_header(types: i64, tallies: i64) -> String {
     format!(
-        "{} type{} \u{b7} {} tallies \u{b7} deleted {}",
-        d.type_count,
-        if d.type_count == 1 { "" } else { "s" },
-        d.entry_count,
-        short_stamp(&d.deleted_at),
+        "{} type{} \u{b7} {} tallies held",
+        types,
+        if types == 1 { "" } else { "s" },
+        tallies
     )
 }
 
-/// `deleted_at` is `YYYY-MM-DD HH:MM:SS.sss`; the seconds are noise in a list.
-fn short_stamp(ts: &str) -> &str {
-    ts.get(..16).unwrap_or(ts)
+/// `2026-09-16 14:03:27.412` → `16 Sep`. Falls back to the raw stamp rather than guessing.
+pub fn short_date(deleted_at: &str) -> String {
+    match deleted_at.get(..10).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) {
+        Some(d) => format!("{} {}", d.day(), MONTHS_SHORT[d.month0() as usize]),
+        None => deleted_at.to_string(),
+    }
+}
+
+const MONTHS_SHORT: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS_LONG: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December",
+];
+
+/// `["2026-08", "2026-09"]` → `"August and September"`. The purge confirmation names the
+/// months whose totals will move, which is the real cost of the action (PLAN §0).
+pub fn months_phrase(months: &[String]) -> String {
+    let names: Vec<String> = months
+        .iter()
+        .map(|m| {
+            match m.get(5..7).and_then(|n| n.parse::<usize>().ok()).filter(|n| (1..=12).contains(n))
+            {
+                Some(n) => MONTHS_LONG[n - 1].to_string(),
+                None => m.clone(),
+            }
+        })
+        .collect();
+    match names.len() {
+        0 => String::new(),
+        1 => names[0].clone(),
+        _ => format!("{} and {}", names[..names.len() - 1].join(", "), names[names.len() - 1]),
+    }
+}
+
+/// The countdown chip's text. Zero reads `Expired`, not `0d` — nothing is auto-purged here
+/// (deliberate deviation from the design's "auto-purge on app start"; see `notes/STATUS.md`),
+/// so the row needs to say it is merely due rather than gone.
+pub fn countdown_label(days: i64) -> String {
+    if days <= 0 {
+        "Expired".to_string()
+    } else {
+        format!("{days}d")
+    }
 }
 
 /// What a restore put back, naming any rename it had to make: `core::trash` renames rather
@@ -1871,63 +1922,76 @@ pub fn restore_notice(r: &RestoreReport) -> String {
     s
 }
 
-/// The trash view: one row per deletion unit, Restore or Purge. Nothing here is destructive
-/// except Purge, which goes through its own blocking confirmation stating the entry count.
+/// The trash view. Restore is per row and needs no confirmation — it is the safe direction.
+/// Purge is the only destructive control, sits at the far end of the footer, and takes the
+/// whole trash at once behind a confirmation naming the tallies and the months they move.
 fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme, snap: &Snap) {
     let Modal::Trash(tm) = &state.modal else { return };
-    let confirm_purge = tm.confirm_purge;
+    let confirming = tm.confirm_purge_all;
     let error = tm.error.clone();
+    let today = chrono::Local::now().date_naive();
 
     let mut close = false;
     let mut restore: Option<i64> = None;
-    let mut ask_purge: Option<i64> = None;
+    let mut ask_purge_all = false;
+
+    let types_held: i64 = snap.trash.iter().map(|d| d.type_count).sum();
+    let tallies_held: i64 = snap.trash.iter().map(|d| d.tally_count).sum();
 
     egui::Modal::new(egui::Id::new("type_trash")).show(ui.ctx(), |ui| {
-        ui.set_width(470.0);
-        ui.label(egui::RichText::new("Trash").font(t::sans_medium(t::SECTION_TITLE)).color(theme.text_primary));
-        ui.label(
-            egui::RichText::new("Deleted types keep their tallies here until they are purged.")
-                .font(t::sans(t::CAPTION))
-                .color(theme.text_quiet),
-        );
+        ui.set_width(560.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Trash").font(t::sans_medium(t::SECTION_TITLE)).color(theme.text_primary),
+            );
+            ui.add_space(8.0);
+            let caption = if snap.trash.is_empty() {
+                "empty".to_string()
+            } else {
+                trash_header(types_held, tallies_held)
+            };
+            ui.label(egui::RichText::new(caption).font(t::mono(t::CAPTION)).color(theme.text_tertiary));
+
+            let free = ui.max_rect().right() - ui.cursor().left() - 20.0;
+            ui.add_space(free.max(8.0));
+            if link_colored(ui, theme.text_secondary, "\u{2715}").clicked() {
+                close = true;
+            }
+        });
+        ui.add_space(6.0);
         ui.separator();
+        ui.add_space(8.0);
 
         if snap.trash.is_empty() {
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new("Nothing in the trash.").font(t::sans(t::BODY)).color(theme.text_quiet));
-            ui.add_space(10.0);
+            trash_empty_state(ui, theme);
         } else {
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Deleted types keep their tallies here until you purge them, so reports for \
+                     past months stay correct. Restoring one puts it back in its category with \
+                     every tally intact.",
+                )
+                .font(t::sans(t::BODY))
+                .color(theme.text_body),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "The countdown marks when a type is old enough to clear out. Nothing is \
+                     removed on its own.",
+                )
+                .font(t::sans(t::CAPTION))
+                .color(theme.text_quiet),
+            );
+            ui.add_space(10.0);
+
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                 for d in &snap.trash {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(&d.summary)
-                                    .font(t::sans_medium(t::BODY))
-                                    .color(theme.text_primary),
-                            );
-                            ui.label(
-                                egui::RichText::new(trash_row_detail(d))
-                                    .font(t::sans(t::CAPTION))
-                                    .color(theme.text_quiet),
-                            );
-                        });
-                        // Measured right-alignment, not `Layout::right_to_left` — nested in a
-                        // horizontal, that layout claims a rect the left column already used.
-                        let right_w = link_width(ui, "Restore") + 10.0 + link_width(ui, "Purge");
-                        let free = ui.max_rect().right() - ui.cursor().left() - right_w;
-                        ui.add_space(free.max(8.0));
-                        if link(ui, theme, "Restore").clicked() {
-                            restore = Some(d.deletion_id);
-                        }
-                        ui.add_space(10.0);
-                        if link_colored(ui, theme.negative, "Purge").clicked() {
-                            ask_purge = Some(d.deletion_id);
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.separator();
+                    if trash_row(ui, theme, d, today) {
+                        restore = Some(d.deletion_id);
+                    }
+                    ui.add_space(TRASH_ROW_GAP);
                 }
             });
         }
@@ -1936,67 +2000,75 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
             ui.add_space(8.0);
             ui.colored_label(theme.negative, err);
         }
+
         ui.add_space(10.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.separator();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if !snap.trash.is_empty() && link_colored(ui, theme.negative, "Purge all now").clicked() {
+                ask_purge_all = true;
+            }
+            let free = ui.max_rect().right() - ui.cursor().left() - button_width(ui, "Close");
+            ui.add_space(free.max(8.0));
             if outline_button(ui, theme, "Close").clicked() {
                 close = true;
             }
         });
     });
 
-    // The blocking purge confirmation, drawn over the list (PLAN §4: purge keeps the loud
-    // confirmation and states the entry count it destroys).
-    let mut do_purge: Option<i64> = None;
-    if let Some(id) = confirm_purge {
-        match snap.trash.iter().find(|d| d.deletion_id == id) {
-            // The row vanished under us (another write rebuilt the view) — drop the prompt.
-            None => {
-                if let Modal::Trash(tm) = &mut state.modal {
-                    tm.confirm_purge = None;
-                }
+    // The blocking confirmation, drawn over the list. It is the only destructive path in the
+    // app, so it states the tally count *and* which months' totals move (PLAN §4).
+    let mut do_purge_all = false;
+    if confirming && !snap.trash.is_empty() {
+        let months = db.trash_months().unwrap_or_default();
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("type_trash_purge_all")).show(ui.ctx(), |ui| {
+            ui.set_width(420.0);
+            ui.label(
+                egui::RichText::new("Purge everything in the trash?")
+                    .font(t::sans_medium(t::SECTION_TITLE))
+                    .color(theme.text_primary),
+            );
+            ui.add_space(8.0);
+            let mut body = format!(
+                "{} task type{} and the {} tallies they hold are removed for good.",
+                types_held,
+                if types_held == 1 { "" } else { "s" },
+                tallies_held,
+            );
+            let phrase = months_phrase(&months);
+            if !phrase.is_empty() {
+                body.push_str(&format!(" Totals for {phrase} will drop by {tallies_held}."));
             }
-            Some(d) => {
-                let mut cancel = false;
-                egui::Modal::new(egui::Id::new("type_trash_purge")).show(ui.ctx(), |ui| {
-                    ui.set_width(380.0);
-                    ui.label(
-                        egui::RichText::new(format!("Purge {}?", d.summary))
-                            .font(t::sans_medium(t::SECTION_TITLE))
-                            .color(theme.text_primary),
-                    );
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "This permanently destroys {} tallies. It cannot be undone.",
-                            d.entry_count
-                        ))
-                        .font(t::sans(t::BODY))
-                        .color(theme.text_body),
-                    );
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if outline_button(ui, theme, "Cancel").clicked() {
-                            cancel = true;
-                        }
-                        ui.add_space(8.0);
-                        if primary_button(ui, theme, "Purge permanently", true, theme.negative) {
-                            do_purge = Some(id);
-                        }
-                    });
-                });
-                if cancel {
-                    if let Modal::Trash(tm) = &mut state.modal {
-                        tm.confirm_purge = None;
-                    }
+            body.push_str(" This cannot be undone.");
+            ui.label(egui::RichText::new(body).font(t::sans(t::BODY)).color(theme.text_body));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                let purge_label =
+                    format!("Purge {} type{}", types_held, if types_held == 1 { "" } else { "s" });
+                let right_w =
+                    button_width(ui, "Keep them") + 10.0 + button_width(ui, &purge_label);
+                let free = ui.max_rect().right() - ui.cursor().left() - right_w;
+                ui.add_space(free.max(8.0));
+                if outline_button(ui, theme, "Keep them").clicked() {
+                    cancel = true;
                 }
+                ui.add_space(10.0);
+                if primary_button(ui, theme, &purge_label, true, theme.negative) {
+                    do_purge_all = true;
+                }
+            });
+        });
+        if cancel {
+            if let Modal::Trash(tm) = &mut state.modal {
+                tm.confirm_purge_all = false;
             }
         }
     }
 
-    if let Some(id) = ask_purge {
+    if ask_purge_all {
         if let Modal::Trash(tm) = &mut state.modal {
-            tm.confirm_purge = Some(id);
+            tm.confirm_purge_all = true;
         }
     }
     if let Some(id) = restore {
@@ -2018,20 +2090,21 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
             }
         }
     }
-    if let Some(id) = do_purge {
-        match db.purge(id) {
-            Ok(n) => {
-                state.notice = Some(format!("Purged {n} tallies."));
+    if do_purge_all {
+        match db.purge_all() {
+            Ok((units, tallies)) => {
+                state.notice =
+                    Some(format!("Purged {units} deleted types and {tallies} tallies."));
                 state.data_changed = true;
                 state.mark_dirty();
                 if let Modal::Trash(tm) = &mut state.modal {
-                    tm.confirm_purge = None;
+                    tm.confirm_purge_all = false;
                     tm.error = None;
                 }
             }
             Err(e) => {
                 if let Modal::Trash(tm) = &mut state.modal {
-                    tm.confirm_purge = None;
+                    tm.confirm_purge_all = false;
                     tm.error = Some(e.to_string());
                 }
             }
@@ -2040,6 +2113,164 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
     if close {
         state.modal = Modal::None;
     }
+}
+
+/// One trash row: category eyebrow over the name over `N tallies · deleted 16 Sep`, with the
+/// retention countdown + draining bar and a `Restore` button on the right. Painted into one
+/// allocated rect rather than nested layouts — see the LAYOUT TRAP note at the top of the file.
+/// Returns whether `Restore` was clicked.
+fn trash_row(ui: &mut egui::Ui, theme: &Theme, d: &DeletionSummary, today: chrono::NaiveDate) -> bool {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, TRASH_ROW_H), egui::Sense::hover());
+
+    let days = simpletally_core::trash::days_left(&d.deleted_at, today);
+    let urgent = days <= TRASH_URGENT_DAYS;
+    let count_color = if urgent { theme.negative } else { theme.accent };
+
+    {
+        let p = ui.painter();
+        p.rect(
+            rect,
+            egui::CornerRadius::same(8),
+            theme.bg_sunken,
+            egui::Stroke::new(1.0, theme.border_subtle),
+            egui::StrokeKind::Inside,
+        );
+
+        let x = rect.left() + 14.0;
+        p.text(
+            egui::pos2(x, rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            d.category_name.to_uppercase(),
+            t::mono(t::EYEBROW),
+            theme.text_tertiary,
+        );
+        p.text(
+            egui::pos2(x, rect.top() + 30.0),
+            egui::Align2::LEFT_TOP,
+            &d.type_name,
+            t::sans_medium(t::BODY),
+            theme.text_primary,
+        );
+        p.text(
+            egui::pos2(x, rect.top() + 56.0),
+            egui::Align2::LEFT_TOP,
+            format!("{} tallies \u{b7} deleted {}", d.tally_count, short_date(&d.deleted_at)),
+            t::mono(t::CAPTION),
+            theme.text_quiet,
+        );
+
+        // Countdown above its bar, both right-aligned to the button's left edge.
+        let bar_right = rect.right() - 14.0 - TRASH_BTN_W - 14.0;
+        p.text(
+            egui::pos2(bar_right, rect.center().y - 6.0),
+            egui::Align2::RIGHT_BOTTOM,
+            countdown_label(days),
+            t::mono(t::BODY),
+            count_color,
+        );
+        let bar_y = rect.center().y + 6.0;
+        let bar_left = bar_right - TRASH_BAR_W;
+        p.line_segment(
+            [egui::pos2(bar_left, bar_y), egui::pos2(bar_right, bar_y)],
+            egui::Stroke::new(2.0, theme.bg_track),
+        );
+        let frac =
+            (days as f32 / simpletally_core::trash::RETENTION_DAYS as f32).clamp(0.0, 1.0);
+        if frac > 0.0 {
+            p.line_segment(
+                [egui::pos2(bar_left, bar_y), egui::pos2(bar_left + TRASH_BAR_W * frac, bar_y)],
+                egui::Stroke::new(2.0, count_color),
+            );
+        } else {
+            // Expired: a stub of colour, so the row still reads as a bar rather than a gap.
+            p.line_segment(
+                [egui::pos2(bar_left, bar_y), egui::pos2(bar_left + 4.0, bar_y)],
+                egui::Stroke::new(2.0, count_color),
+            );
+        }
+    }
+
+    let btn_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 14.0 - TRASH_BTN_W, rect.center().y - TRASH_BTN_H / 2.0),
+        egui::vec2(TRASH_BTN_W, TRASH_BTN_H),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("trash_restore", d.deletion_id))
+            .max_rect(btn_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    accent_outline_button(&mut child, theme, "Restore", btn_rect.size()).clicked()
+}
+
+/// A `Restore`-style button: accent text and border on the raised fill, at an exact size.
+fn accent_outline_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    size: egui::Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let fill = if resp.hovered() { theme.accent_tint_bg } else { theme.bg_raised };
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(6),
+        fill,
+        egui::Stroke::new(1.0, theme.accent_tint_border),
+        egui::StrokeKind::Inside,
+    );
+    let galley =
+        ui.painter().layout_no_wrap(label.to_owned(), t::sans_medium(t::CAPTION), theme.accent);
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.rect.width() / 2.0,
+            rect.center().y - galley.rect.height() / 2.0,
+        ),
+        galley,
+        theme.accent,
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// The empty state: a big muted zero, then what the trash is for.
+fn trash_empty_state(ui: &mut egui::Ui, theme: &Theme) {
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(10),
+            theme.bg_sunken,
+            egui::Stroke::new(1.0, theme.border_subtle),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "0",
+            t::mono(22.0),
+            theme.text_disabled,
+        );
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("Nothing deleted")
+                .font(t::sans_medium(t::SECTION_TITLE))
+                .color(theme.text_primary),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "Deleted task types land here with their tallies, in case a report needs them back.",
+            )
+            .font(t::sans(t::BODY))
+            .color(theme.text_quiet),
+        );
+    });
+    ui.add_space(24.0);
 }
 
 // --- category management (screen 08) ------------------------------------------------------
@@ -2725,25 +2956,40 @@ fn pencil_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 mod tests {
     use super::*;
 
-    fn deletion(types: i64, entries: i64) -> DeletionSummary {
-        DeletionSummary {
-            deletion_id: 1,
-            deleted_at: "2026-09-18 14:03:27.412".into(),
-            kind: "task_type".into(),
-            summary: "PENGAWASAN - Rekonsiliasi (12 entries)".into(),
-            type_count: types,
-            entry_count: entries,
-        }
+    #[test]
+    fn trash_header_reads_what_is_held() {
+        assert_eq!(trash_header(3, 47), "3 types \u{b7} 47 tallies held");
+        assert_eq!(trash_header(1, 0), "1 type \u{b7} 0 tallies held");
     }
 
     #[test]
-    fn trash_detail_pluralises_and_trims_the_stamp() {
-        assert_eq!(trash_row_detail(&deletion(1, 12)), "1 type \u{b7} 12 tallies \u{b7} deleted 2026-09-18 14:03");
-        assert_eq!(trash_row_detail(&deletion(2, 0)), "2 types \u{b7} 0 tallies \u{b7} deleted 2026-09-18 14:03");
-        // A short/odd stamp must not panic or slice mid-character.
-        let mut d = deletion(1, 1);
-        d.deleted_at = "2026".into();
-        assert!(trash_row_detail(&d).ends_with("2026"));
+    fn short_date_formats_the_stamp_and_survives_a_bad_one() {
+        assert_eq!(short_date("2026-09-16 14:03:27.412"), "16 Sep");
+        assert_eq!(short_date("2026-01-02 00:00:00.000"), "2 Jan");
+        assert_eq!(short_date("nonsense"), "nonsense");
+    }
+
+    #[test]
+    fn countdown_says_expired_rather_than_zero_days() {
+        assert_eq!(countdown_label(28), "28d");
+        assert_eq!(countdown_label(1), "1d");
+        assert_eq!(countdown_label(0), "Expired");
+        assert_eq!(countdown_label(-5), "Expired");
+    }
+
+    #[test]
+    fn months_phrase_lists_the_months_a_purge_would_move() {
+        let m = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(months_phrase(&m(&[])), "");
+        assert_eq!(months_phrase(&m(&["2026-09"])), "September");
+        assert_eq!(months_phrase(&m(&["2026-08", "2026-09"])), "August and September");
+        assert_eq!(
+            months_phrase(&m(&["2026-08", "2026-09", "2026-10"])),
+            "August, September and October"
+        );
+        // A malformed month must not panic or index out of range.
+        assert_eq!(months_phrase(&m(&["2026-99"])), "2026-99");
+        assert_eq!(months_phrase(&m(&["x"])), "x");
     }
 
     #[test]
