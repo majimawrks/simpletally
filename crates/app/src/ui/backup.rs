@@ -134,6 +134,54 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
     if !state.visible {
         return;
     }
+
+    // A successful write gets its own confirmation modal (checkmark + Open location + OK),
+    // drawn instead of the main dialog. OK clears the outcome and returns here. Errors stay
+    // inline in the main dialog below, next to the buttons that produced them.
+    if let Some(Outcome::Wrote(path)) = &state.outcome {
+        let path = path.clone();
+        let mut dismiss = false;
+        egui::Modal::new(egui::Id::new("backup_success")).show(ui.ctx(), |ui| {
+            const W: f32 = 360.0;
+            ui.set_width(W);
+            ui.vertical_centered(|ui| {
+                ui.add_space(8.0);
+                paint_check(ui, theme);
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("Backup created")
+                        .font(t::sans_medium(t::SECTION_TITLE))
+                        .color(theme.text_primary),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(path.display().to_string())
+                        .font(t::mono(t::CAPTION))
+                        .color(theme.text_body),
+                );
+                ui.add_space(18.0);
+                if secondary_button(ui, theme, "Open backup location", 200.0) {
+                    reveal_in_explorer(&path);
+                }
+                ui.add_space(10.0);
+                let ok = primary_button(ui, theme, "OK", 200.0);
+                // Auto-focus OK so Enter/Space closes the modal without a click. Only claim
+                // focus when nothing else holds it, so it isn't stolen back every frame.
+                if ui.memory(|m| m.focused().is_none()) {
+                    ok.request_focus();
+                }
+                if ok.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    dismiss = true;
+                }
+                ui.add_space(4.0);
+            });
+        });
+        if dismiss {
+            state.outcome = None;
+        }
+        return;
+    }
+
     let mut close = false;
 
     egui::Modal::new(egui::Id::new("backup_data")).show(ui.ctx(), |ui| {
@@ -162,24 +210,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
             ui.add_space(14.0);
         }
 
-        if let Some(outcome) = &state.outcome {
-            match outcome {
-                Outcome::Wrote(path) => {
-                    ui.label(
-                        egui::RichText::new(format!("Saved to {}", path.display()))
-                            .font(t::sans(t::CAPTION))
-                            .color(theme.text_body),
-                    );
-                }
-                Outcome::Err(e) => {
-                    ui.colored_label(theme.negative, e);
-                }
-            }
+        // Success is intercepted above as its own modal; only an error is shown inline here,
+        // beside the buttons, so the user can retry without losing the dialog.
+        if let Some(Outcome::Err(e)) = &state.outcome {
+            ui.colored_label(theme.negative, e);
             ui.add_space(10.0);
         }
 
         ui.horizontal(|ui| {
-            if secondary_button(ui, theme, "Back up task types") {
+            if secondary_button(ui, theme, "Back up task types", 0.0) {
                 let now = chrono::Local::now().naive_local();
                 if let Some(path) = rfd::FileDialog::new()
                     .set_file_name(&task_types_filename(now))
@@ -190,7 +229,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
                 }
             }
             ui.add_space(8.0);
-            if primary_button(ui, theme, "Back up all data") {
+            if primary_button(ui, theme, "Back up all data", 0.0).clicked() {
                 let now = chrono::Local::now().naive_local();
                 if let Some(path) = rfd::FileDialog::new()
                     .set_file_name(&full_backup_filename(now))
@@ -214,16 +253,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
     }
 }
 
-/// The solid-accent primary button ("Back up all data"), same silhouette as
-/// `types::import_report_modal`'s "Close".
-fn primary_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
+/// The solid-accent primary button ("Back up all data" / "OK"), same silhouette as
+/// `types::import_report_modal`'s "Close". Returns the response so callers can focus it.
+fn primary_button(ui: &mut egui::Ui, theme: &Theme, label: &str, min_w: f32) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).font(t::sans_medium(t::BODY)).color(theme.bg_raised))
             .fill(theme.accent)
             .corner_radius(6)
-            .min_size(egui::vec2(0.0, 32.0)),
+            .min_size(egui::vec2(min_w, 32.0)),
     )
-    .clicked()
 }
 
 /// A neutral bordered button ("Close") — bg_raised fill, a plain border, no color claim.
@@ -241,15 +279,37 @@ fn outline_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
 /// The secondary button beside the accent-filled primary ("Back up task types" next to "Back
 /// up all data"). Copies `migrate::secondary_button`'s treatment: `theme.secondary`, the blue
 /// sibling of the accent, tinted rather than solid so it stays subordinate to the primary.
-fn secondary_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
+fn secondary_button(ui: &mut egui::Ui, theme: &Theme, label: &str, min_w: f32) -> bool {
     ui.add(
         egui::Button::new(egui::RichText::new(label).font(t::sans_medium(t::BODY)).color(theme.secondary))
             .fill(theme.secondary_tint_bg)
             .stroke(egui::Stroke::new(1.0, theme.secondary_tint_border))
             .corner_radius(6)
-            .min_size(egui::vec2(0.0, 32.0)),
+            .min_size(egui::vec2(min_w, 32.0)),
     )
     .clicked()
+}
+
+/// A success badge: a filled accent disc with a checkmark cut in the modal's own surface
+/// colour. Painted, not a glyph — the bundled fonts have no dependable symbol coverage (same
+/// reason `types::paint_icon` exists).
+fn paint_check(ui: &mut egui::Ui, theme: &Theme) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+    let c = rect.center();
+    ui.painter().circle_filled(c, 24.0, theme.accent);
+    let s = egui::Stroke::new(3.5, theme.bg_raised);
+    let p = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
+    ui.painter().line_segment([p(-9.0, 0.5), p(-2.5, 7.0)], s); // short arm
+    ui.painter().line_segment([p(-2.5, 7.0), p(9.5, -7.5)], s); // long arm
+}
+
+/// Open the OS file browser with `path` selected. Best-effort: a failed reveal is not worth
+/// surfacing — the path is already on screen above the button.
+fn reveal_in_explorer(path: &Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    #[cfg(not(target_os = "windows"))]
+    let _ = path; // only Windows is shipped; keeps other targets compiling for tests
 }
 
 #[cfg(test)]
