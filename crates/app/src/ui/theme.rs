@@ -207,6 +207,13 @@ pub struct Theme {
     pub accent_muted_bar: egui::Color32,
     pub negative: egui::Color32,
 
+    /// Muted amber for the header date **when it is not today** — the user has navigated to a
+    /// past/future day with the nav pills. Green (`accent`) means "today, live"; amber means
+    /// "you're viewing another date". A deliberate third hue (the palette is otherwise two),
+    /// chosen because "heads up, not the default state" is exactly amber's convention. Tuned per
+    /// theme for legibility on each canvas.
+    pub pinned_date: egui::Color32,
+
     // --- secondary accent -----------------------------------------------------------------
     /// A blue sibling of `accent`: the same saturation and lightness, hue rotated to ~205°, so
     /// it reads as part of the same family rather than an imported colour. Added because the
@@ -285,6 +292,10 @@ impl Theme {
             accent_eyebrow: C::from_rgb(0x7A, 0x9E, 0x88),
             accent_muted_bar: C::from_rgb(0x8F, 0xC7, 0xA8),
             negative: C::from_rgb(0xB4, 0x48, 0x3F),
+
+            // Amber at ~hue 32°, held to a lightness/saturation that reads on the near-white
+            // canvas without shouting — a muted orange, not a warning red.
+            pinned_date: C::from_rgb(0xB5, 0x72, 0x2A),
 
             // `accent` #3F9C6A at hue 205° instead of 150°, saturation and lightness held.
             secondary: C::from_rgb(0x40, 0x75, 0x9C),
@@ -367,6 +378,10 @@ impl Theme {
             accent_muted_bar: C::from_rgb(0x4E, 0x7D, 0x63),
             // Derived: same hue as light's negative, lightened for dark-surface contrast.
             negative: C::from_rgb(0xD1, 0x6E, 0x64),
+
+            // Same amber hue as light, lightened for contrast on the dark canvas (mirrors how
+            // `negative` and `accent` brighten from light to dark).
+            pinned_date: C::from_rgb(0xD8, 0x9A, 0x52),
 
             // `accent-dark-theme` #4FB37D at hue 205°, saturation and lightness held.
             secondary: C::from_rgb(0x51, 0x8A, 0xB3),

@@ -527,8 +527,8 @@ pub fn show(
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(&snap.headline)
-                            .font(t::mono(t::EYEBROW))
-                            .color(theme.text_tertiary),
+                            .font(t::mono_medium(t::DAY_NAV))
+                            .color(if is_today { theme.accent } else { theme.pinned_date }),
                     );
                     ui.label(
                         egui::RichText::new(snap.day_total.to_string())
