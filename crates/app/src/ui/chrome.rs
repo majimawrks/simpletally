@@ -35,11 +35,21 @@ impl Tab {
     }
 }
 
+/// The outcome of drawing the tab strip for one frame.
+pub struct TabStrip {
+    /// The strip's bottom edge (in `ui`'s coordinate space), so the caller can hand the screen
+    /// below it the remaining rect.
+    pub bottom: f32,
+    /// The info glyph on the right was clicked — open the About dialog.
+    pub about_clicked: bool,
+}
+
 /// Renders the tab strip and updates `active` on a click. Row below the title bar: 10px top
-/// padding, 22px horizontal padding. Returns the strip's bottom edge (in `ui`'s coordinate
-/// space) so the caller can hand the screen below it the remaining rect.
-pub fn tab_strip(ui: &mut egui::Ui, theme: &Theme, active: &mut Tab) -> f32 {
-    egui::Frame::default()
+/// padding, 22px horizontal padding. The right end always carries an info glyph (About), with
+/// the quick-add hint to its left on the Today tab.
+pub fn tab_strip(ui: &mut egui::Ui, theme: &Theme, active: &mut Tab) -> TabStrip {
+    let mut about_clicked = false;
+    let bottom = egui::Frame::default()
         .fill(theme.bg_canvas)
         .inner_margin(egui::Margin { left: 22, right: 22, top: 10, bottom: 0i8 })
         .show(ui, |ui| {
@@ -54,20 +64,47 @@ pub fn tab_strip(ui: &mut egui::Ui, theme: &Theme, active: &mut Tab) -> f32 {
                     }
                     ui.add_space(4.0);
                 }
-                if *active == Tab::Today {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right end (added right-to-left, so the glyph is rightmost): the About glyph,
+                // then the quick-add hint on Today.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    about_clicked = about_glyph(ui, theme).clicked();
+                    if *active == Tab::Today {
+                        ui.add_space(12.0);
                         ui.label(
                             egui::RichText::new("Ctrl+Shift+T quick add")
                                 .font(t::mono(11.5))
                                 .color(theme.text_tertiary),
                         );
-                    });
-                }
+                    }
+                });
             });
         })
         .response
         .rect
-        .bottom()
+        .bottom();
+    TabStrip { bottom, about_clicked }
+}
+
+/// The info-circle glyph that opens the About dialog: a painted `(i)`, quiet in `text_tertiary`,
+/// tinting to accent on hover. Painted, not a font glyph — the bundled fonts have no symbol set.
+fn about_glyph(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
+    let d = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::click());
+    let color = if resp.hovered() { theme.accent } else { theme.text_tertiary };
+    let c = rect.center();
+    let p = ui.painter();
+    p.circle(c, 9.0, egui::Color32::TRANSPARENT, egui::Stroke::new(1.5, color));
+    // The dot of the 'i'.
+    p.circle_filled(egui::pos2(c.x, c.y - 4.0), 1.3, color);
+    // The stem.
+    p.line_segment(
+        [egui::pos2(c.x, c.y - 1.0), egui::pos2(c.x, c.y + 4.5)],
+        egui::Stroke::new(1.7, color),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text("About SimpleTally")
 }
 
 /// One tab button: 8px/16px padding, 6px radius, 13.5px. Active gets `bg_tab_active` fill +

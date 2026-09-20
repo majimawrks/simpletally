@@ -54,7 +54,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TrayNoticeState, theme: &Theme) -> Ac
     }
     let mut closed = false;
 
-    egui::Modal::new(egui::Id::new("hide_to_tray_notice")).show(ui.ctx(), |ui| {
+    let resp = egui::Modal::new(egui::Id::new("hide_to_tray_notice")).show(ui.ctx(), |ui| {
         const W: f32 = 400.0;
         ui.set_width(W);
         ui.allocate_exact_size(egui::vec2(W, 0.0), egui::Sense::hover());
@@ -128,7 +128,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut TrayNoticeState, theme: &Theme) -> Ac
         });
     });
 
-    if closed {
+    // Esc / click-away dismisses like "Got it": honour the current switch and remember state.
+    if closed || resp.should_close() {
         state.visible = false;
         return Action::Closed {
             remember: state.dont_show_again,

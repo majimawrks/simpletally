@@ -141,7 +141,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
     if let Some(Outcome::Wrote(path)) = &state.outcome {
         let path = path.clone();
         let mut dismiss = false;
-        egui::Modal::new(egui::Id::new("backup_success")).show(ui.ctx(), |ui| {
+        let resp = egui::Modal::new(egui::Id::new("backup_success")).show(ui.ctx(), |ui| {
             const W: f32 = 360.0;
             ui.set_width(W);
             ui.vertical_centered(|ui| {
@@ -176,7 +176,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
                 ui.add_space(4.0);
             });
         });
-        if dismiss {
+        if dismiss || resp.should_close() {
             state.outcome = None;
         }
         return;
@@ -184,7 +184,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
 
     let mut close = false;
 
-    egui::Modal::new(egui::Id::new("backup_data")).show(ui.ctx(), |ui| {
+    let resp = egui::Modal::new(egui::Id::new("backup_data")).show(ui.ctx(), |ui| {
         const W: f32 = 420.0;
         ui.set_width(W);
         // Pin the width: the body's card row is a fixed shape, but the outcome line below it
@@ -248,7 +248,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut BackupState, db: &Db, theme: &Theme) 
         });
     });
 
-    if close {
+    if close || resp.should_close() {
         state.visible = false;
     }
 }

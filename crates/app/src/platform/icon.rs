@@ -9,6 +9,10 @@ use std::io::Cursor;
 
 /// The `.ico` bytes, baked into the binary at compile time.
 const ICON_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/icon.ico"));
+/// The GitHub mark (white silhouette on transparent), for the About dialog's repo link. Tinted
+/// at render time, so it's stored white. Same `.ico` container so the same decoder serves it.
+const GITHUB_BYTES: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/github.ico"));
 
 pub struct Rgba {
     pub pixels: Vec<u8>,
@@ -16,20 +20,30 @@ pub struct Rgba {
     pub height: u32,
 }
 
-/// Decode the largest frame in the `.ico` to RGBA.
-pub fn decode() -> Rgba {
-    let dir = ico::IconDir::read(Cursor::new(ICON_BYTES)).expect("assets/icon.ico is not a valid ICO");
+/// Decode the largest frame of an `.ico` to RGBA.
+fn decode_bytes(bytes: &[u8], what: &str) -> Rgba {
+    let dir = ico::IconDir::read(Cursor::new(bytes)).unwrap_or_else(|_| panic!("{what} is not a valid ICO"));
     let entry = dir
         .entries()
         .iter()
         .max_by_key(|e| u32::from(e.width()))
-        .expect("assets/icon.ico has no image entries");
+        .unwrap_or_else(|| panic!("{what} has no image entries"));
     let image = entry.decode().expect("failed to decode icon frame");
     Rgba {
         pixels: image.rgba_data().to_vec(),
         width: image.width(),
         height: image.height(),
     }
+}
+
+/// The app icon, decoded to RGBA.
+pub fn decode() -> Rgba {
+    decode_bytes(ICON_BYTES, "assets/icon.ico")
+}
+
+/// The GitHub mark, decoded to RGBA (white on transparent — tint when drawing).
+pub fn github() -> Rgba {
+    decode_bytes(GITHUB_BYTES, "assets/github.ico")
 }
 
 /// Tray icon.

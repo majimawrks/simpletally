@@ -135,7 +135,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut MigrateState, theme: &Theme, exe_dir:
     let mut refuse: Option<String> = None;
     const LIVE_DB_MSG: &str = "that's already this app's live database";
 
-    egui::Modal::new(egui::Id::new("migrate_old_data")).show(ui.ctx(), |ui| {
+    let resp = egui::Modal::new(egui::Id::new("migrate_old_data")).show(ui.ctx(), |ui| {
         const MODAL_W: f32 = 460.0;
         ui.set_width(MODAL_W);
         // Pin the used rect to the full width — the modal frame otherwise resizes as the
@@ -286,7 +286,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut MigrateState, theme: &Theme, exe_dir:
     if let Some(msg) = refuse {
         state.outcome = Outcome::Refused(msg);
     }
-    if close {
+    if close || resp.should_close() {
         state.visible = false;
     }
     action

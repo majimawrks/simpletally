@@ -99,6 +99,8 @@ pub struct App {
     pending_import: Option<PathBuf>,
     /// The one-time "closing hides to the tray" notice.
     tray_notice: crate::ui::tray_notice::TrayNoticeState,
+    /// The About dialog, opened from the tab strip's info glyph.
+    about: crate::ui::about::AboutState,
     /// Mirrors `Settings::hide_to_tray_notice_dismissed`; the live value `current_settings`
     /// writes back. Loaded at startup, set when the user ticks the checkbox.
     hide_to_tray_notice_dismissed: bool,
@@ -265,6 +267,7 @@ impl App {
             pending_geometry: loaded_settings.main_window_geometry,
             pending_import: None,
             tray_notice: crate::ui::tray_notice::TrayNoticeState::default(),
+            about: crate::ui::about::AboutState::new(),
             hide_to_tray_notice_dismissed: loaded_settings.hide_to_tray_notice_dismissed,
             close_quits: loaded_settings.close_quits,
             quit_requested: false,
@@ -312,6 +315,7 @@ impl App {
         let tab = &mut self.tab;
         let migrate = &mut self.migrate;
         let tray_notice = &mut self.tray_notice;
+        let about = &mut self.about;
         let db = &self.db;
         let theme = &self.theme;
         let hotkey_error = self.hotkey_error.as_deref();
@@ -322,9 +326,12 @@ impl App {
             win.next_repaint = None;
             win.paint(clear, |ui| {
                 let full = ui.max_rect();
-                let strip_bottom = crate::ui::chrome::tab_strip(ui, theme, tab);
+                let strip = crate::ui::chrome::tab_strip(ui, theme, tab);
+                if strip.about_clicked {
+                    about.open();
+                }
                 let body_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.left(), strip_bottom),
+                    egui::pos2(full.left(), strip.bottom),
                     full.max,
                 );
                 let mut body = ui.new_child(
@@ -350,6 +357,7 @@ impl App {
                     migrate_action = crate::ui::migrate::show(ui, migrate, theme, &exe_dir, &live_db);
                 }
                 notice_action = crate::ui::tray_notice::show(ui, tray_notice, theme);
+                crate::ui::about::show(ui, about, theme);
             });
             // The Task types screen can write data the other screens show (categories behind
             // Today's pill row, trash restore/purge moving entries) while they aren't the

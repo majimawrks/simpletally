@@ -773,6 +773,15 @@ fn name_w(avail: f32) -> f32 {
     (avail - CAT_W - DESC_W - USED_W - STATUS_W - GAP * 4.0).max(80.0)
 }
 
+/// A row's right-click menu choice, applied after the row loop.
+enum RowAction {
+    Edit,
+    ToggleActive,
+    Delete,
+    /// Flip active state for the whole current selection (right-clicked a multi-selected row).
+    BulkToggle,
+}
+
 fn table(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap, db: &Db) {
     let rows = filter_types(&snap.types, &state.search, state.category_filter, state.active_filter);
     // Reserve the scrollbar's width, or the rightmost column is clipped by it once the
@@ -806,6 +815,14 @@ fn table(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap, 
     let mut clicked: Option<(i64, bool)> = None; // (id, ctrl)
     let mut open_edit: Option<i64> = None; // double-click opens the edit dialog
     let mut toggle: Option<i64> = None;
+    let mut ctx_action: Option<(i64, RowAction)> = None; // right-click menu choice
+    let mut ctx_select: Option<i64> = None; // right-click highlights its row
+    // Selection stats for the multi-select context menu, read before the row loop borrows.
+    let sel_len = state.selection.len();
+    let sel_any_active = state
+        .selection
+        .iter()
+        .any(|id| snap.types.iter().find(|t| t.id == *id).map(|t| t.is_active).unwrap_or(false));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.style_mut().interaction.selectable_labels = false;
         const ROW_H: f32 = 42.0;
@@ -882,6 +899,42 @@ fn table(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap, 
                 let ctrl = ui.input(|i| i.modifiers.ctrl);
                 clicked = Some((ty.id, ctrl));
             }
+            // Right-click: a contextual menu. Actions are collected and applied after the loop,
+            // like every other row interaction here, to avoid borrowing `state` while iterating
+            // `rows`. When the row is part of a multi-selection the menu acts on the whole
+            // selection; otherwise it targets (and highlights) just this row.
+            let multi = selected && sel_len > 1;
+            if resp.secondary_clicked() && !multi {
+                ctx_select = Some(ty.id);
+            }
+            resp.context_menu(|ui| {
+                if multi {
+                    let label = if sel_any_active {
+                        format!("Deactivate {sel_len} selected")
+                    } else {
+                        format!("Activate {sel_len} selected")
+                    };
+                    if ui.button(label).clicked() {
+                        ctx_action = Some((ty.id, RowAction::BulkToggle));
+                        ui.close();
+                    }
+                } else {
+                    if ui.button("Edit").clicked() {
+                        ctx_action = Some((ty.id, RowAction::Edit));
+                        ui.close();
+                    }
+                    let toggle_label = if ty.is_active { "Deactivate" } else { "Activate" };
+                    if ui.button(toggle_label).clicked() {
+                        ctx_action = Some((ty.id, RowAction::ToggleActive));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Delete\u{2026}").clicked() {
+                        ctx_action = Some((ty.id, RowAction::Delete));
+                        ui.close();
+                    }
+                }
+            });
         }
     });
 
@@ -914,6 +967,59 @@ fn table(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap, 
             }
         }
     }
+    // Right-click highlight, then the menu choice. Both act on the single clicked row.
+    if let Some(id) = ctx_select {
+        state.selection.clear();
+        state.selection.insert(id);
+    }
+    if let Some((id, action)) = ctx_action {
+        if let Some(ty) = snap.types.iter().find(|t| t.id == id) {
+            match action {
+                RowAction::Edit => {
+                    state.selection.clear();
+                    state.selection.insert(id);
+                    state.modal = Modal::Edit(edit_type_form(ty, db));
+                }
+                RowAction::ToggleActive => {
+                    if let Err(e) =
+                        db.edit_task_type(ty.id, ty.category_id, &ty.name, &ty.description, !ty.is_active)
+                    {
+                        state.notice = Some(e.to_string());
+                    } else {
+                        state.notice = None;
+                        state.mark_written();
+                    }
+                }
+                RowAction::Delete => {
+                    // Reuse the edit dialog's delete overlay (the three-outcome dialog): open
+                    // the edit form and immediately raise its delete sub-dialog.
+                    state.selection.clear();
+                    state.selection.insert(id);
+                    let mut form = edit_type_form(ty, db);
+                    match load_delete_form(db, id, &ty.name) {
+                        Ok(df) => form.delete = Some(df),
+                        Err(e) => form.error = Some(e.to_string()),
+                    }
+                    state.modal = Modal::Edit(form);
+                }
+                RowAction::BulkToggle => {
+                    let target = !sel_any_active;
+                    let mut first_err = None;
+                    for sid in state.selection.clone() {
+                        if let Some(ty) = snap.types.iter().find(|t| t.id == sid) {
+                            if let Err(e) =
+                                db.edit_task_type(ty.id, ty.category_id, &ty.name, &ty.description, target)
+                            {
+                                first_err.get_or_insert(e.to_string());
+                            }
+                        }
+                    }
+                    state.notice = first_err;
+                    state.mark_written();
+                }
+            }
+        }
+    }
 }
 
 /// A fully-rounded status pill, right-aligned within a `width`-wide column centered at `pos`'s
@@ -941,30 +1047,63 @@ fn status_pill(ui: &mut egui::Ui, theme: &Theme, col_left: egui::Pos2, width: f3
     resp.on_hover_text(tip)
 }
 
-/// The caption line below the table, plus selection actions.
+/// The caption line below the table, plus selection actions. The selection group (`N selected`
+/// + Edit/Deactivate) is pinned to the far right; a notice fills the gap in between and is
+/// **truncated with a tooltip** when it would otherwise run under the pinned group.
 fn caption(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap, db: &Db) {
+    // Deactivating a mixed selection deactivates all of them; only an all-inactive selection
+    // offers "Activate". Computed up front so its label width feeds the right-group measurement.
+    let any_active = state
+        .selection
+        .iter()
+        .any(|id| snap.types.iter().find(|t| t.id == *id).map(|t| t.is_active).unwrap_or(false));
+    let action_label = if any_active { "Deactivate" } else { "Activate" };
+    let single = state.selection.len() == 1;
+
     ui.horizontal(|ui| {
+        // Explicit gaps only — no per-item spacing to throw off the right-group width math.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let row_right = ui.max_rect().right();
+
         ui.label(
             egui::RichText::new("Select rows to edit or deactivate.")
                 .font(t::sans(13.0))
                 .color(theme.text_secondary),
         );
+
+        // Width of the pinned right group, so we can right-align it and bound the notice.
+        let sel_text = format!("{} selected", state.selection.len());
+        let mut group_w = 0.0;
+        if !state.selection.is_empty() {
+            group_w += text_width(ui, &sel_text, t::sans(13.0)) + 14.0;
+            if single {
+                group_w += link_width(ui, "Edit") + 10.0;
+            }
+            group_w += link_width(ui, action_label);
+        }
+        let group_left = row_right - group_w;
+
         if let Some(msg) = state.notice.clone() {
             ui.add_space(14.0);
-            ui.label(egui::RichText::new(msg).font(t::sans(t::CAPTION)).color(theme.negative));
+            let start = ui.cursor().left();
+            let avail = (group_left - start - 14.0).max(40.0);
+            let (shown, truncated) = truncate_to_width(ui, &msg, t::sans(t::CAPTION), avail);
+            let resp = ui.label(egui::RichText::new(shown).font(t::sans(t::CAPTION)).color(theme.negative));
+            if truncated {
+                resp.on_hover_text(msg);
+            }
         }
+
         if state.selection.is_empty() {
             return;
         }
-        ui.add_space(14.0);
-        ui.label(
-            egui::RichText::new(format!("{} selected", state.selection.len()))
-                .font(t::sans(13.0))
-                .color(theme.text_primary),
-        );
+        // Jump to the pinned position; the group below is exactly `group_w` wide, so it ends at
+        // the row's right edge regardless of how long the notice was.
+        ui.add_space((group_left - ui.cursor().left()).max(0.0));
+        ui.label(egui::RichText::new(sel_text).font(t::sans(13.0)).color(theme.text_primary));
         ui.add_space(14.0);
 
-        if state.selection.len() == 1 {
+        if single {
             if link(ui, theme, "Edit").clicked() {
                 let id = *state.selection.iter().next().expect("selection is non-empty");
                 if let Some(ty) = snap.types.iter().find(|t| t.id == id) {
@@ -974,13 +1113,7 @@ fn caption(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme, snap: &Snap
             ui.add_space(10.0);
         }
 
-        // Deactivating a mixed selection deactivates all of them; only an all-inactive
-        // selection offers "Activate".
-        let any_active = state.selection.iter().any(|id| {
-            snap.types.iter().find(|t| t.id == *id).map(|t| t.is_active).unwrap_or(false)
-        });
-        let label = if any_active { "Deactivate" } else { "Activate" };
-        if link(ui, theme, label).clicked() {
+        if link(ui, theme, action_label).clicked() {
             let target_active = !any_active;
             let mut first_err = None;
             for id in state.selection.clone() {
@@ -1823,7 +1956,7 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
         }
     }
     let mut close = false;
-    egui::Modal::new(egui::Id::new("type_import_report")).show(ui.ctx(), |ui| {
+    let resp = egui::Modal::new(egui::Id::new("type_import_report")).show(ui.ctx(), |ui| {
         const W: f32 = 420.0;
         ui.set_width(W);
         // Pin the width: the body switches between the card grid and a one-line error, and the
@@ -1885,7 +2018,7 @@ fn import_report_modal(ui: &mut egui::Ui, state: &mut TypesState, theme: &Theme)
             }
         });
     });
-    if close {
+    if close || resp.should_close() {
         state.modal = Modal::None;
     }
 }
@@ -1997,7 +2130,7 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
     let types_held: i64 = snap.trash.iter().map(|d| d.type_count).sum();
     let tallies_held: i64 = snap.trash.iter().map(|d| d.tally_count).sum();
 
-    egui::Modal::new(egui::Id::new("type_trash")).show(ui.ctx(), |ui| {
+    let resp = egui::Modal::new(egui::Id::new("type_trash")).show(ui.ctx(), |ui| {
         ui.set_width(560.0);
 
         let caption = if snap.trash.is_empty() {
@@ -2073,7 +2206,7 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
     if confirming && !snap.trash.is_empty() {
         let months = db.trash_months().unwrap_or_default();
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("type_trash_purge_all")).show(ui.ctx(), |ui| {
+        let purge_resp = egui::Modal::new(egui::Id::new("type_trash_purge_all")).show(ui.ctx(), |ui| {
             ui.set_width(420.0);
             ui.label(
                 egui::RichText::new("Purge everything in the trash?")
@@ -2110,7 +2243,7 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
                 }
             });
         });
-        if cancel {
+        if cancel || purge_resp.should_close() {
             if let Modal::Trash(tm) = &mut state.modal {
                 tm.confirm_purge_all = false;
             }
@@ -2161,7 +2294,9 @@ fn trash_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, theme: &Theme
             }
         }
     }
-    if close {
+    // Esc/click-away closes the trash, but only when the purge confirmation isn't stacked on
+    // top of it — that sub-modal handles its own dismissal above.
+    if close || (!confirming && resp.should_close()) {
         state.modal = Modal::None;
     }
 }
@@ -2392,7 +2527,7 @@ fn manage_categories_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, t
 
     {
         let Modal::ManageCategories(modal) = &mut state.modal else { unreachable!() };
-        egui::Modal::new(egui::Id::new("manage_categories")).show(ui.ctx(), |ui| {
+        let resp = egui::Modal::new(egui::Id::new("manage_categories")).show(ui.ctx(), |ui| {
             const MODAL_W: f32 = 440.0;
             ui.set_width(MODAL_W);
             // Pin the used rect to the full width: the modal frame sizes itself to its
@@ -2585,7 +2720,13 @@ fn manage_categories_modal(ui: &mut egui::Ui, state: &mut TypesState, db: &Db, t
             });
         });
 
+        // Esc/click-away closes this, but only when the move sub-dialog isn't stacked over it
+        // (checked before it runs, so the sub-dialog gets the key first).
+        let move_open = modal.move_dialog.is_some();
         move_dialog(ui, modal, db, theme, &mut data_changed, &mut today_dirty);
+        if !move_open && resp.should_close() {
+            close = true;
+        }
     }
 
     if today_dirty {
@@ -2935,6 +3076,24 @@ fn move_dialog(
 /// [`button_width`], which adds button chrome).
 fn text_width(ui: &egui::Ui, label: &str, font: egui::FontId) -> f32 {
     ui.painter().layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER).rect.width()
+}
+
+/// Trim `text` from the end (on char boundaries) until it plus an ellipsis fits in `max_w`,
+/// returning the shown string and whether it was cut. Caller shows the full text as a tooltip
+/// when `true`. ponytail: linear scan of layout calls, fine for a one-line caption.
+fn truncate_to_width(ui: &egui::Ui, text: &str, font: egui::FontId, max_w: f32) -> (String, bool) {
+    if text_width(ui, text, font.clone()) <= max_w {
+        return (text.to_string(), false);
+    }
+    let mut s = text.to_string();
+    while !s.is_empty() {
+        s.pop();
+        let candidate = format!("{}\u{2026}", s.trim_end());
+        if text_width(ui, &candidate, font.clone()) <= max_w {
+            return (candidate, true);
+        }
+    }
+    ("\u{2026}".to_string(), true)
 }
 
 /// A right-aligned text action within an explicit `rect` (design: row-level `Save` /
