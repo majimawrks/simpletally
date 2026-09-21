@@ -2,6 +2,8 @@
 
 A small desktop app for counting the work you do, one tap at a time.
 
+![The Today screen with example task types imported](docs/screenshots/main-window.png)
+
 SimpleTally keeps a running tally of tasks by type and by day, then adds them up
 into the numbers you need for workload analysis. It's built for work that's a
 stream of small, repeatable tasks, where the question at the end of the quarter
@@ -22,6 +24,9 @@ never talks to the internet.
   letters, hit Enter, and the tally is recorded without the main window ever
   coming to the front. Add several at once by typing a number ("answer email 3"),
   or correct a miscount by subtracting ("meeting -1").
+
+  ![The quick-add popup](docs/screenshots/quick-add.png)
+
 - **Insights that answer the quarterly question.** Pick a week, month, quarter,
   year, or a custom range, and see how many of each task type you handled, which
   categories carried the load, and how it compares to the range before. Every
